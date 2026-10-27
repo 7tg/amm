@@ -30,3 +30,26 @@ test('events are filtered by run, worker and cursor', () => {
   assert.deepEqual(s.events({ runId: 'r1', afterId: a }).map((e) => e.kind), ['done']);
   s.close();
 });
+
+test('put overwrites a document and stores a copy', () => {
+  const file = dbFile();
+  const s = new Store(file);
+  const doc: Session = { id: 's1', cwd: '/a', firstSeen: 1, lastSeen: 1 };
+  s.put('sessions', doc);
+  doc.cwd = 'mutated';
+  assert.equal(s.get('sessions', 's1')?.cwd, '/a');
+  s.put('sessions', { id: 's1', cwd: '/b', firstSeen: 1, lastSeen: 2 });
+  assert.equal(s.all('sessions').length, 1);
+  s.close();
+  const s2 = new Store(file);
+  assert.equal(s2.get('sessions', 's1')?.cwd, '/b');
+  s2.close();
+});
+
+test('events respects limit and clamps it to at least 1', () => {
+  const s = new Store(dbFile());
+  for (let i = 1; i <= 5; i++) s.addEvent({ ts: i, runId: 'r', workerId: null, kind: 'k', detail: {} });
+  assert.equal(s.events({ limit: 2 }).length, 2);
+  assert.equal(s.events({ limit: 0 }).length, 1);
+  s.close();
+});

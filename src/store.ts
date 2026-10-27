@@ -1,4 +1,4 @@
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type { AmmEvent, Brief, Run, Session, Worker } from './types.ts';
 
 interface Docs {
@@ -27,13 +27,18 @@ export class Store {
     sessions: new Map(),
   };
 
+  private putStmts = new Map<Table, StatementSync>();
+
   constructor(file: string) {
     this.db = new DatabaseSync(file);
     this.db.exec('PRAGMA journal_mode = WAL');
+    this.db.exec('PRAGMA busy_timeout = 5000');
     for (const t of TABLES) this.db.exec(`CREATE TABLE IF NOT EXISTS ${t} (id TEXT PRIMARY KEY, data TEXT NOT NULL)`);
     this.db.exec(
       'CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, run_id TEXT, worker_id TEXT, kind TEXT NOT NULL, detail TEXT NOT NULL)',
     );
+    this.db.exec('CREATE INDEX IF NOT EXISTS events_run ON events (run_id, id)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS events_worker ON events (worker_id, id)');
     for (const t of TABLES) {
       const map = this.cache[t] as Map<string, { id: string }>;
       for (const row of this.db.prepare(`SELECT data FROM ${t}`).all()) {
@@ -52,8 +57,13 @@ export class Store {
   }
 
   put<T extends Table>(t: T, doc: Docs[T]): void {
-    (this.cache[t] as Map<string, Docs[T]>).set(doc.id, doc);
-    this.db.prepare(`INSERT OR REPLACE INTO ${t} (id, data) VALUES (?, ?)`).run(doc.id, JSON.stringify(doc));
+    let stmt = this.putStmts.get(t);
+    if (!stmt) {
+      stmt = this.db.prepare(`INSERT OR REPLACE INTO ${t} (id, data) VALUES (?, ?)`);
+      this.putStmts.set(t, stmt);
+    }
+    stmt.run(doc.id, JSON.stringify(doc));
+    (this.cache[t] as Map<string, Docs[T]>).set(doc.id, structuredClone(doc));
   }
 
   addEvent(e: Omit<AmmEvent, 'id'>): number {
@@ -68,7 +78,7 @@ export class Store {
       .prepare(
         'SELECT * FROM events WHERE id > ? AND (? IS NULL OR run_id = ?) AND (? IS NULL OR worker_id = ?) ORDER BY id LIMIT ?',
       )
-      .all(f.afterId ?? 0, f.runId ?? null, f.runId ?? null, f.workerId ?? null, f.workerId ?? null, f.limit ?? 1000);
+      .all(f.afterId ?? 0, f.runId ?? null, f.runId ?? null, f.workerId ?? null, f.workerId ?? null, Math.min(10000, Math.max(1, f.limit ?? 1000)));
     return rows.map((r) => ({
       id: Number(r.id),
       ts: Number(r.ts),
