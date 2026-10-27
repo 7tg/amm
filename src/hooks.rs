@@ -5,7 +5,7 @@ use crate::config::{Limits, tool_name};
 use crate::git::{changed_files, git, worktree_info};
 use crate::rules::{Counters, RuleContext, ToolEvent, Verdict, evaluate, is_edit_tool};
 use crate::scope::in_scope;
-use crate::service::{AmmResult, BindClaim, validate_worktree};
+use crate::service::{AmmResult, BindClaim, WorktreeCheck, validate_worktree};
 use crate::types::{Brief, ReportStatus, Run, Worker, WorkerState};
 use regex::Regex;
 use serde::Deserialize;
@@ -78,6 +78,29 @@ fn tail(s: &str, n: usize) -> String {
     s.chars().skip(len.saturating_sub(n)).collect()
 }
 
+/// Logs a failure that must not change a decision already made (the daemon's stderr is its log).
+fn log_err(what: &str, e: impl std::fmt::Display) {
+    eprintln!("amm: {what}: {e}");
+}
+
+type ValidateFn = dyn Fn(&Path, &Path) -> Result<WorktreeCheck, String> + Send + Sync;
+type DiffFn = dyn Fn(&Path, &str, &str) -> Result<Vec<String>, String> + Send + Sync;
+
+/// The blocking work the handlers delegate, swappable in tests to land a cancel or a branch move mid-flight.
+#[derive(Clone)]
+pub(crate) struct Seams {
+    /// Bind phase 2: `validate_worktree(run_repo, cwd)`.
+    pub validate: Arc<ValidateFn>,
+    /// The gate's diff: `changed_files(root, base_sha, sha)`.
+    pub diff: Arc<DiffFn>,
+}
+
+impl Default for Seams {
+    fn default() -> Self {
+        Seams { validate: Arc::new(validate_worktree), diff: Arc::new(changed_files) }
+    }
+}
+
 /// Handles one hook event. On an internal error (unknown run or brief, a store failure) it returns `{"error": ...}`,
 /// like the TS handler throwing; use `try_handle_hook` to tell the two apart.
 pub async fn handle_hook(state: &Arc<Mutex<Amm>>, event: &str, input: HookInput) -> Value {
@@ -88,6 +111,10 @@ pub async fn handle_hook(state: &Arc<Mutex<Amm>>, event: &str, input: HookInput)
 }
 
 pub async fn try_handle_hook(state: &Arc<Mutex<Amm>>, event: &str, input: HookInput) -> AmmResult<Value> {
+    handle_with(state, event, input, Seams::default()).await
+}
+
+pub(crate) async fn handle_with(state: &Arc<Mutex<Amm>>, event: &str, input: HookInput, seams: Seams) -> AmmResult<Value> {
     let Some(agent_id) = input.agent_id.clone().filter(|a| !a.is_empty()) else {
         return main_session(state, event, &input);
     };
@@ -104,9 +131,9 @@ pub async fn try_handle_hook(state: &Arc<Mutex<Amm>>, event: &str, input: HookIn
                 ),
             ))
         }
-        "PreToolUse" => pre_tool(state, &agent_id, &input).await,
+        "PreToolUse" => pre_tool(state, &agent_id, &input, &seams).await,
         "PostToolUse" | "PostToolUseFailure" => post_tool(state, &agent_id, &input, event),
-        "SubagentStop" => subagent_stop(state, &agent_id, &input).await,
+        "SubagentStop" => subagent_stop(state, &agent_id, &input, &seams).await,
         _ => Ok(allow()),
     }
 }
@@ -133,7 +160,7 @@ fn main_session(state: &Arc<Mutex<Amm>>, event: &str, input: &HookInput) -> AmmR
 }
 
 /// The three bind phases: claim under the lock, validate the worktree on the blocking pool, finish under the lock.
-async fn bind(state: &Arc<Mutex<Amm>>, brief_id: &str, agent_id: &str, cwd: &str) -> Result<Worker, String> {
+async fn bind(state: &Arc<Mutex<Amm>>, brief_id: &str, agent_id: &str, cwd: &str, seams: &Seams) -> Result<Worker, String> {
     let (claimed, repo) = {
         let mut amm = lock(state);
         match amm.claim_bind(brief_id, agent_id, Path::new(cwd))? {
@@ -146,8 +173,8 @@ async fn bind(state: &Arc<Mutex<Amm>>, brief_id: &str, agent_id: &str, cwd: &str
     };
     let check = match repo {
         Ok(repo) => {
-            let cwd = cwd.to_string();
-            tokio::task::spawn_blocking(move || validate_worktree(Path::new(&repo), Path::new(&cwd)))
+            let (cwd, validate) = (cwd.to_string(), seams.validate.clone());
+            tokio::task::spawn_blocking(move || validate(Path::new(&repo), Path::new(&cwd)))
                 .await
                 .unwrap_or_else(|e| Err(format!("worktree validation failed: {e}")))
         }
@@ -156,36 +183,39 @@ async fn bind(state: &Arc<Mutex<Amm>>, brief_id: &str, agent_id: &str, cwd: &str
     lock(state).finish_bind(&claimed.id, agent_id, check)
 }
 
-async fn pre_tool(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput) -> AmmResult<Value> {
+/// What an amm worker with no worker record may do: load tools, nothing else.
+fn unbound(input: &HookInput, tool: &str) -> Value {
+    if !is_worker(input) || tool == "ToolSearch" {
+        return allow();
+    }
+    deny("amm: fetch your brief first with amm_brief_get")
+}
+
+async fn pre_tool(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput, seams: &Seams) -> AmmResult<Value> {
     let tool = input.tool_name.clone().unwrap_or_default();
     let ti = input.tool_input.clone().unwrap_or_else(|| json!({}));
     let token = ti.get("token").and_then(Value::as_str).map(str::to_string);
-    let (found, brief_get) = {
+    let (found, brief_get, report) = {
         let amm = lock(state);
-        (amm.worker_by_agent(agent_id), tool_name("amm_brief_get", &amm.env))
+        (amm.worker_by_agent(agent_id), tool_name("amm_brief_get", &amm.env), tool_name("amm_report", &amm.env))
     };
     let found = match found {
         Some(w) => w,
-        None if is_worker(input) => {
-            if tool == brief_get
-                && let Some(token) = &token
-            {
-                match bind(state, token, agent_id, &input.cwd).await {
-                    Ok(w) => w,
-                    Err(e) => return Ok(deny(&format!("amm: {e}. Work from the worktree amm created for you."))),
-                }
-            } else if tool != "ToolSearch" && tool != brief_get {
-                return Ok(deny("amm: fetch your brief first with amm_brief_get"));
-            } else {
-                return Ok(allow());
+        None if is_worker(input) && tool == brief_get && token.is_some() => {
+            match bind(state, token.as_deref().unwrap_or_default(), agent_id, &input.cwd, seams).await {
+                Ok(w) => w,
+                Err(e) => return Ok(deny(&format!("amm: {e}. Work from the worktree amm created for you."))),
             }
         }
-        None => return Ok(allow()),
+        None if is_worker(input) && tool == brief_get => return Ok(allow()),
+        None => return Ok(unbound(input, &tool)),
     };
     let (w, b) = {
         let mut amm = lock(state);
-        // Re-read: the worker may have moved on while a bind ran without the lock.
-        let found = amm.store.get::<Worker>(&found.id).unwrap_or(found);
+        // Re-read: the worker may have moved on, or lost this agent, while the lock was released.
+        let Some(found) = amm.store.get::<Worker>(&found.id).filter(|w| w.agent_id.as_deref() == Some(agent_id)) else {
+            return Ok(unbound(input, &tool));
+        };
         match found.state {
             WorkerState::Cancelled => {
                 return Ok(deny("amm: your manager cancelled this brief. Stop now and reply CANCELLED."));
@@ -198,6 +228,9 @@ async fn pre_tool(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput) ->
         if found.base_sha.is_none() && tool != brief_get {
             return Ok(deny("amm: setting up your brief, retry"));
         }
+        if tool.contains("amm_") && tool != brief_get && tool != report {
+            return Ok(deny("amm: workers may only use amm_brief_get and amm_report"));
+        }
         if tool.contains("amm_")
             && let Some(token) = &token
             && *token != found.brief_id
@@ -205,16 +238,41 @@ async fn pre_tool(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput) ->
             return Ok(deny("amm: that token belongs to another brief. Use only your own token."));
         }
         // A checking worker holds a lease stretched by the gate budget; touching it would cut that back.
-        let w = if found.state == WorkerState::Checking { found } else { amm.touch_worker(&found)? };
-        if let Some(correction) = amm.take_correction(&w)? {
-            return Ok(deny(&correction));
+        let w = if found.state == WorkerState::Checking {
+            found
+        } else {
+            amm.touch_worker(&found).unwrap_or_else(|e| {
+                log_err("touch worker", e);
+                found
+            })
+        };
+        let pending = w.pending_correction.clone().filter(|m| !m.is_empty());
+        match amm.take_correction(&w) {
+            Ok(Some(correction)) => return Ok(deny(&correction)),
+            Ok(None) => {}
+            // The correction may be cleared already; deliver it rather than lose it.
+            Err(e) => {
+                log_err("take correction", &e);
+                match pending {
+                    Some(correction) => return Ok(deny(&correction)),
+                    None => return Err(e),
+                }
+            }
         }
         let b = amm.brief(&w.brief_id)?;
         (w, b)
     };
-    // Resolves paths on disk, so it runs without the lock.
-    if let Some(reason) = forbidden(&w, &b, &tool, &ti) {
-        lock(state).event("deny", Some(&w.run_id), Some(&w.id), json!({ "tool": tool, "reason": reason }))?;
+    // Resolves paths on disk, so it runs on the blocking pool without the lock.
+    let reason = {
+        let (w, b, tool, ti) = (w.clone(), b, tool.clone(), ti);
+        tokio::task::spawn_blocking(move || forbidden(&w, &b, &tool, &ti))
+            .await
+            .unwrap_or_else(|e| Some(format!("amm: could not check this call ({e}), retry")))
+    };
+    if let Some(reason) = reason {
+        if let Err(e) = lock(state).event("deny", Some(&w.run_id), Some(&w.id), json!({ "tool": tool, "reason": reason })) {
+            log_err("deny event", e);
+        }
         return Ok(deny(&reason));
     }
     Ok(allow())
@@ -334,26 +392,29 @@ fn post_tool(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput, event: 
     }
     detail.insert("failed".into(), json!(failed));
     detail.insert("summary".into(), json!(summarize(input, &ti)));
-    amm.event("tool", Some(&w.run_id), Some(&w.id), Value::Object(detail))?;
+    // From here the verdict is decided: event or transition failures are logged, never change it.
+    if let Err(e) = amm.event("tool", Some(&w.run_id), Some(&w.id), Value::Object(detail)) {
+        log_err("tool event", e);
+    }
     match verdict {
         Verdict::Correct { rule, message } => {
-            amm.event(
-                "correction",
-                Some(&w.run_id),
-                Some(&w.id),
-                json!({ "rule": rule, "message": message, "via": "context" }),
-            )?;
+            let d = json!({ "rule": rule, "message": message, "via": "context" });
+            if let Err(e) = amm.event("correction", Some(&w.run_id), Some(&w.id), d) {
+                log_err("correction event", e);
+            }
             Ok(add_context(event, &message))
         }
         Verdict::Escalate { rule } => {
-            amm.escalate(&updated, &format!("{rule} rule fired again after a correction"))?;
+            if let Err(e) = amm.escalate(&updated, &format!("{rule} rule fired again after a correction")) {
+                log_err("escalate", e);
+            }
             Ok(add_context(event, "amm: you are being replaced by a stronger worker. Stop now and reply REASSIGNED."))
         }
         Verdict::Ok => Ok(allow()),
     }
 }
 
-async fn subagent_stop(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput) -> AmmResult<Value> {
+async fn subagent_stop(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput, seams: &Seams) -> AmmResult<Value> {
     let (checking, b, repo, limits, report_tool) = {
         let mut amm = lock(state);
         let Some(w) = amm.worker_by_agent(agent_id).filter(|w| w.state == WorkerState::Running) else {
@@ -361,7 +422,9 @@ async fn subagent_stop(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInpu
         };
         let b = amm.brief(&w.brief_id)?;
         if b.report.as_ref().is_some_and(|r| r.status == ReportStatus::Blocked) {
-            amm.mark_blocked(&w)?;
+            if let Err(e) = amm.mark_blocked(&w) {
+                log_err("mark blocked", e);
+            }
             return Ok(allow());
         }
         let Some(checking) = amm.mark_checking(&w, input.agent_transcript_path.clone())? else {
@@ -371,24 +434,36 @@ async fn subagent_stop(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInpu
         (checking, b, repo, amm.limits.clone(), tool_name("amm_report", &amm.env))
     };
     let (problems, gated_sha) = {
-        let (w, b, limits) = (checking.clone(), b.clone(), limits.clone());
-        tokio::task::spawn_blocking(move || gate_problems(&w, &b, Path::new(&repo), &limits, &report_tool))
+        let (w, b, limits, diff) = (checking.clone(), b.clone(), limits.clone(), seams.diff.clone());
+        tokio::task::spawn_blocking(move || gate_problems(&w, &b, Path::new(&repo), &limits, &report_tool, &*diff))
             .await
             .unwrap_or_else(|e| (vec![format!("amm could not run the done gate: {e}")], None))
     };
     let mut amm = lock(state);
     if problems.is_empty() {
-        amm.complete(&checking, gated_sha)?;
+        if let Err(e) = amm.complete(&checking, gated_sha) {
+            log_err("complete", e);
+        }
         return Ok(allow());
     }
+    let block = || block_stop(&format!("amm done gate failed:\n- {}\nFix these, then finish again.", problems.join("\n- ")));
     // None: the worker was cancelled or swept while its checks ran; let it stop.
-    let Some(next) = amm.stop_blocked(&checking, &problems)? else { return Ok(allow()) };
+    let next = match amm.stop_blocked(&checking, &problems) {
+        Ok(Some(next)) => next,
+        Ok(None) => return Ok(allow()),
+        Err(e) => {
+            log_err("stop blocked", e);
+            return Ok(block());
+        }
+    };
     if next.stop_blocks >= limits.max_stop_blocks {
         let reason = format!("done gate failed {} times: {}", next.stop_blocks, first_line(&problems[0]));
-        amm.escalate(&next, &reason)?;
+        if let Err(e) = amm.escalate(&next, &reason) {
+            log_err("escalate", e);
+        }
         return Ok(allow());
     }
-    Ok(block_stop(&format!("amm done gate failed:\n- {}\nFix these, then finish again.", problems.join("\n- "))))
+    Ok(block())
 }
 
 /// The worktree must still be what bind validated; checked before and after the checks run.
@@ -415,8 +490,24 @@ fn verify_worktree(w: &Worker, repo: &Path) -> Option<String> {
     }
 }
 
+/// The commit `refs/heads/<branch>` points at, if git can read it.
+fn branch_head(wt: &str, branch: &str) -> Option<String> {
+    git(Path::new(wt), &["rev-parse", "--verify", "--end-of-options", &format!("refs/heads/{branch}^{{commit}}")])
+        .ok()
+        .filter(|r| r.code == 0)
+        .map(|r| r.stdout.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// The done gate's git and check work. Blocking: run it on the blocking pool, without the lock.
-fn gate_problems(w: &Worker, b: &Brief, repo: &Path, limits: &Limits, report_tool: &str) -> (Vec<String>, Option<String>) {
+fn gate_problems(
+    w: &Worker,
+    b: &Brief,
+    repo: &Path,
+    limits: &Limits,
+    report_tool: &str,
+    diff: &DiffFn,
+) -> (Vec<String>, Option<String>) {
     let mut problems = Vec::new();
     if b.report.is_none() {
         problems.push(format!("you have not called {report_tool} with token \"{}\"", b.id));
@@ -444,35 +535,35 @@ fn gate_problems(w: &Worker, b: &Brief, repo: &Path, limits: &Limits, report_too
     if let Some(a) = &after {
         problems.push(format!("after the checks: {a}"));
     }
-    let mut gated_sha = None;
-    if before.is_none() && after.is_none() {
-        // verify_worktree passed, so all three are set.
-        let (wt, base, branch) = (w.worktree.as_deref().unwrap(), w.base_sha.as_deref().unwrap(), w.branch.as_deref().unwrap());
-        let head = git(Path::new(wt), &["rev-parse", "--verify", &format!("refs/heads/{branch}")])
-            .map(|r| r.stdout.trim().to_string())
-            .unwrap_or_default();
-        gated_sha = Some(head).filter(|s| !s.is_empty());
-        if gated_sha.is_none() {
-            problems.push("amm could not read your branch head".into());
-        }
-        match changed_files(Path::new(wt), base, branch) {
-            Ok(files) => {
-                let outside: Vec<String> = files
-                    .into_iter()
-                    .filter(|f| !in_scope(&Path::new(wt).join(f).to_string_lossy(), wt, &b.scope))
-                    .collect();
-                if !outside.is_empty() {
-                    problems.push(format!(
-                        "files changed outside your scope: {}. Revert them and describe the needed change in amm_report instead",
-                        outside.join(", ")
-                    ));
-                }
-            }
-            // Fail closed: an unreadable worktree must not pass the gate.
-            Err(e) => problems.push(format!("amm could not list your changed files: {}", first_line(&e))),
-        }
+    if before.is_some() || after.is_some() {
+        return (problems, None);
     }
-    (problems, gated_sha)
+    // verify_worktree passed, so all three are set.
+    let (wt, base, branch) = (w.worktree.as_deref().unwrap(), w.base_sha.as_deref().unwrap(), w.branch.as_deref().unwrap());
+    // Read the head once and diff exactly that commit: the gated sha is what was scope-checked.
+    let Some(sha) = branch_head(wt, branch) else {
+        problems.push("amm could not read your branch head".into());
+        return (problems, None);
+    };
+    match diff(Path::new(wt), base, &sha) {
+        Ok(files) => {
+            let outside: Vec<String> =
+                files.into_iter().filter(|f| !in_scope(&Path::new(wt).join(f).to_string_lossy(), wt, &b.scope)).collect();
+            if !outside.is_empty() {
+                problems.push(format!(
+                    "files changed outside your scope: {}. Revert them and describe the needed change in amm_report instead",
+                    outside.join(", ")
+                ));
+            }
+        }
+        // Fail closed: an unreadable worktree must not pass the gate.
+        Err(e) => problems.push(format!("amm could not list your changed files: {}", first_line(&e))),
+    }
+    // Final identity check: the branch must still point at the commit that was diffed.
+    if branch_head(wt, branch).as_deref() != Some(sha.as_str()) {
+        problems.push(format!("after the checks: your branch {branch} moved while amm checked it. Finish again"));
+    }
+    (problems, Some(sha))
 }
 
 #[cfg(test)]
@@ -491,6 +582,7 @@ mod tests {
         state: State,
         repo: PathBuf,
         b: Brief,
+        dir: PathBuf,
     }
 
     impl Bound {
@@ -533,6 +625,11 @@ mod tests {
 
     /// An Amm with a run, one dispatched brief and its worktree, not yet bound.
     fn dispatched(checks: &[&str]) -> (State, PathBuf, PathBuf, Run, Brief) {
+        let (state, main, repo, run, b, _dir) = dispatched_in(checks);
+        (state, main, repo, run, b)
+    }
+
+    fn dispatched_in(checks: &[&str]) -> (State, PathBuf, PathBuf, Run, Brief, PathBuf) {
         let mut h = make_amm(DEFAULT_LIMITS);
         let main = init_repo_with(&[("src/a.ts", "a\n"), ("README.md", "r\n")]);
         let repo = add_worktree(&main, &rand_name());
@@ -546,12 +643,12 @@ mod tests {
             .unwrap();
         let b = h.amm.add_brief(&run.id, brief_input(&["src/**"], checks), BriefState::Queued).unwrap();
         h.amm.dispatch(&run.id).unwrap();
-        (Arc::new(Mutex::new(h.amm)), main, repo, run, b)
+        (Arc::new(Mutex::new(h.amm)), main, repo, run, b, h.dir)
     }
 
     async fn bound_worker(checks: &[&str]) -> Bound {
-        let (state, _main, repo, _run, b) = dispatched(checks);
-        let h = Bound { state, repo, b };
+        let (state, _main, repo, _run, b, dir) = dispatched_in(checks);
+        let h = Bound { state, repo, b, dir };
         h.hook("PreToolUse", json!({ "tool_name": "mcp__plugin_amm_amm__amm_brief_get", "tool_input": { "token": h.b.id } }))
             .await;
         h
@@ -862,6 +959,131 @@ mod tests {
         let w = h.worker();
         assert_eq!(w.state, WorkerState::Done);
         assert_eq!(w.gated_sha, Some(git_in(&h.repo, &["rev-parse", w.branch.as_deref().unwrap()])));
+    }
+
+
+    fn stop_input() -> HookInput {
+        serde_json::from_value(json!({ "session_id": "s", "cwd": "/", "hook_event_name": "SubagentStop", "agent_id": "ag1",
+                                       "agent_type": "amm:amm-worker-light" }))
+        .unwrap()
+    }
+
+    fn with_diff(diff: impl Fn(&Path, &str, &str) -> Result<Vec<String>, String> + Send + Sync + 'static) -> Seams {
+        Seams { diff: Arc::new(diff), ..Seams::default() }
+    }
+
+    #[tokio::test]
+    async fn the_gate_diffs_the_exact_sha_it_read_and_fails_if_the_branch_moves() {
+        let h = bound_worker(&[]).await;
+        h.report(ReportStatus::Done);
+        let read_head = git_in(&h.repo, &["rev-parse", "HEAD"]);
+        let seen = Arc::new(Mutex::new(None));
+        let seams = {
+            let seen = seen.clone();
+            with_diff(move |root, base, sha| {
+                *seen.lock().unwrap() = Some(sha.to_string());
+                let files = crate::git::changed_files(root, base, sha);
+                // A worker process that outlived the checks moves the branch after amm read it.
+                std::fs::write(root.join("README.md"), "evil\n").unwrap();
+                commit_all(root, "evil");
+                files
+            })
+        };
+        let out = handle_with(&h.state, "SubagentStop", stop_input(), seams).await.unwrap();
+        assert_eq!(seen.lock().unwrap().as_deref(), Some(read_head.as_str()));
+        assert_eq!(out["decision"], "block");
+        assert!(reason(&out).contains("after the checks") && reason(&out).contains("moved"), "{out}");
+        assert_ne!(h.amm().brief(&h.b.id).unwrap().state, BriefState::Done);
+    }
+
+    #[tokio::test]
+    async fn a_decided_deny_survives_a_failed_event_write() {
+        let h = bound_worker(&[]).await;
+        h.amm().nudge(&h.b.id, "stop").unwrap();
+        rusqlite::Connection::open(h.dir.join("amm.db")).unwrap().execute_batch("DROP TABLE events").unwrap();
+        let read = h.hook("PreToolUse", json!({ "tool_name": "Read", "tool_input": {} })).await;
+        assert!(deny_of(&read).contains("from your manager): stop"), "{read}");
+        let push = h.hook("PreToolUse", json!({ "tool_name": "Bash", "tool_input": { "command": "git push" } })).await;
+        assert!(deny_of(&push).contains("may not push"), "{push}");
+    }
+
+    #[tokio::test]
+    async fn a_bound_worker_may_only_use_amm_brief_get_and_amm_report() {
+        let h = bound_worker(&[]).await;
+        for tool in ["amm_cancel", "amm_status", "amm_nudge"] {
+            let out = h
+                .hook("PreToolUse", json!({ "tool_name": format!("mcp__plugin_amm_amm__{tool}"), "tool_input": { "token": h.b.id } }))
+                .await;
+            assert!(deny_of(&out).contains("workers may only use amm_brief_get and amm_report"), "{tool}: {out}");
+        }
+        for tool in ["amm_brief_get", "amm_report"] {
+            let out = h
+                .hook("PreToolUse", json!({ "tool_name": format!("mcp__plugin_amm_amm__{tool}"), "tool_input": { "token": h.b.id } }))
+                .await;
+            assert_eq!(deny_reason(&out), None, "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_the_gate_stays_cancelled() {
+        let h = bound_worker(&[]).await;
+        h.report(ReportStatus::Done);
+        let seams = {
+            let (state, id) = (h.state.clone(), h.b.id.clone());
+            with_diff(move |root, base, sha| {
+                state.lock().unwrap().cancel(&id).unwrap();
+                crate::git::changed_files(root, base, sha)
+            })
+        };
+        assert_eq!(handle_with(&h.state, "SubagentStop", stop_input(), seams).await.unwrap(), json!({}));
+        assert_eq!(h.amm().brief(&h.b.id).unwrap().state, BriefState::Cancelled);
+        assert_eq!(h.worker().state, WorkerState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn an_escalation_during_the_gate_is_not_overwritten_by_completion() {
+        let h = bound_worker(&[]).await;
+        h.report(ReportStatus::Done);
+        let seams = {
+            let state = h.state.clone();
+            with_diff(move |root, base, sha| {
+                let mut amm = state.lock().unwrap();
+                let w = amm.worker_by_agent("ag1").unwrap();
+                assert!(amm.escalate(&w, "manager").unwrap());
+                drop(amm);
+                crate::git::changed_files(root, base, sha)
+            })
+        };
+        assert_eq!(handle_with(&h.state, "SubagentStop", stop_input(), seams).await.unwrap(), json!({}));
+        let b = h.amm().brief(&h.b.id).unwrap();
+        assert_eq!((b.state, b.tier), (BriefState::Queued, Tier::Standard));
+        let w = h.worker();
+        assert_eq!((w.state, w.gated_sha), (WorkerState::Escalated, None));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_bind_stays_cancelled_and_binds_nothing() {
+        let (state, _main, repo, _run, b) = dispatched(&[]);
+        let seams = {
+            let (st, id) = (state.clone(), b.id.clone());
+            Seams {
+                validate: Arc::new(move |run_repo, cwd| {
+                    st.lock().unwrap().cancel(&id).unwrap();
+                    validate_worktree(run_repo, cwd)
+                }),
+                ..Seams::default()
+            }
+        };
+        let input = serde_json::from_value(json!({ "session_id": "s", "cwd": repo, "hook_event_name": "PreToolUse",
+            "agent_id": "ag1", "agent_type": "amm:amm-worker-light", "tool_name": "mcp__plugin_amm_amm__amm_brief_get",
+            "tool_input": { "token": b.id } }))
+        .unwrap();
+        let out = handle_with(&state, "PreToolUse", input, seams).await.unwrap();
+        assert!(deny_reason(&out).is_some(), "{out}");
+        let amm = state.lock().unwrap();
+        assert_eq!(amm.brief(&b.id).unwrap().state, BriefState::Cancelled);
+        let w = amm.store.all::<Worker>().into_iter().find(|w| w.brief_id == b.id).unwrap();
+        assert_eq!((w.state, w.base_sha), (WorkerState::Cancelled, None));
     }
 
     // Not in the TS suite: the TS event loop serialised binds; here two hooks race on a multi-threaded runtime.
