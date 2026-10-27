@@ -5,8 +5,11 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time", "net", "sync", "io-util"] }
 axum = "0.8"
+tower-http = { version = "0.6", features = ["catch-panic"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 rmcp = { version = "3.8", features = ["server", "transport-io"] }
 ureq = { version = "3", default-features = false }
 rusqlite = { version = "0.41", features = ["bundled"] }

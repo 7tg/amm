@@ -1,3 +1,5 @@
+use amm::config::{DEFAULT_PORT, Env, amm_home};
+use amm::daemon::{DaemonOpts, run_daemon};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -19,11 +21,59 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
-    let name = match cli.command {
-        Command::Daemon => "daemon".to_string(),
-        Command::Shim => "shim".to_string(),
-        Command::Hook { event } => format!("hook {event}"),
-    };
-    eprintln!("amm {name}: not implemented");
+    match cli.command {
+        Command::Daemon => std::process::exit(daemon()),
+        Command::Shim => eprintln!("amm shim: not implemented"),
+        Command::Hook { event } => eprintln!("amm hook {event}: not implemented"),
+    }
     std::process::exit(2);
+}
+
+fn daemon() -> i32 {
+    let env: Env = std::env::vars().collect();
+    let port = match env.get("AMM_PORT").map(|p| p.trim()).filter(|p| !p.is_empty()) {
+        None => DEFAULT_PORT,
+        Some(p) => match p.parse::<u16>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("amm: bad AMM_PORT {p:?}");
+                return 1;
+            }
+        },
+    };
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("amm: {e}");
+            return 1;
+        }
+    };
+    rt.block_on(async {
+        use tokio::signal::unix::{SignalKind, signal};
+        // Installed before the daemon starts, so an early signal is not lost to the default handler.
+        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+            eprintln!("amm: cannot install signal handlers");
+            return 1;
+        };
+        let d = match run_daemon(DaemonOpts { home: amm_home(&env), port, ..Default::default() }).await {
+            Ok(Some(d)) => d,
+            Ok(None) => return 0,
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        };
+        println!("amm daemon pid {} on 127.0.0.1:{}", std::process::id(), d.port());
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+            _ = d.closed() => return 0,
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            std::process::exit(1);
+        });
+        d.close().await;
+        0
+    })
 }
