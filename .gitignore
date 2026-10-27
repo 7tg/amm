@@ -1,4 +1,5 @@
-docs/
+docs/*
+!docs/media/
 .claude/worktrees/
 .amm/
 target/
