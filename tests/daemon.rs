@@ -91,7 +91,7 @@ async fn daemon_serves_health_rejects_bad_tokens_and_runs_api_ops() {
     let c = Client::of(&home);
     let run = c.call("run_start", json!({ "repo": common::init_repo(), "test_cmd": "true", "base_branch": "main" })).await;
     let id = run.body["result"]["run_id"].as_str().unwrap().to_string();
-    assert!(regex::Regex::new(r"^r[0-9a-f]{6}$").unwrap().is_match(&id), "{id}");
+    assert!(regex::Regex::new(r"^r[0-9a-f]{16}$").unwrap().is_match(&id), "{id}");
     let bad = c.call("dispatch", json!({ "run_id": "nope" })).await;
     assert_eq!((bad.status, bad.body["error"].as_str()), (400, Some("unknown run nope")));
     let hook = c.hook("PreToolUse", json!({ "session_id": "s", "cwd": "/", "agent_id": "x", "tool_name": "Read" })).await;

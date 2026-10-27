@@ -181,24 +181,75 @@ pub fn worktree_info(cwd: &Path) -> Result<WorktreeInfo, String> {
 /// working tree runs no repo-planted command. Attributes can come from the tree, .git/info/attributes or config, so
 /// the drivers themselves are disabled; env config outranks every config file and takes any subsection name.
 fn no_filters(root: &Path) -> Result<Vec<(String, String)>, String> {
-    let r = git(root, &["config", "--name-only", "--get-regexp", r"^filter\."])?;
+    config_env(root, &[], false)
+}
+
+/// Config names (`<section>.<sub>`) under `section`, deduplicated, from every config file git reads.
+fn subsections(root: &Path, section: &str) -> Result<Vec<String>, String> {
+    let r = git(root, &["config", "--name-only", "--get-regexp", &format!(r"^{section}\.")])?;
     if r.code > 1 {
         return Err(format!("git config failed: {}", r.stderr.trim()));
     }
-    let mut drivers: Vec<&str> =
-        r.stdout.lines().filter_map(|l| l.strip_prefix("filter.")?.rsplit_once('.').map(|(d, _)| d)).collect();
-    drivers.sort();
-    drivers.dedup();
-    let pairs: Vec<(String, &str)> = drivers
-        .iter()
-        .flat_map(|d| [(format!("filter.{d}.clean"), ""), (format!("filter.{d}.process"), ""), (format!("filter.{d}.required"), "false")])
-        .collect();
+    let prefix = format!("{section}.");
+    let mut subs: Vec<String> =
+        r.stdout.lines().filter_map(|l| l.strip_prefix(&prefix)?.rsplit_once('.').map(|(d, _)| d.to_string())).collect();
+    subs.sort();
+    subs.dedup();
+    Ok(subs)
+}
+
+/// Env config: every filter driver off (and, with `checkout`, also `smudge` and every custom merge driver, which
+/// checkouts and merges would run), followed by `extra`.
+fn config_env(root: &Path, extra: &[(String, String)], checkout: bool) -> Result<Vec<(String, String)>, String> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for d in subsections(root, "filter")? {
+        pairs.push((format!("filter.{d}.clean"), String::new()));
+        pairs.push((format!("filter.{d}.process"), String::new()));
+        pairs.push((format!("filter.{d}.required"), "false".into()));
+        if checkout {
+            pairs.push((format!("filter.{d}.smudge"), String::new()));
+        }
+    }
+    if checkout {
+        for d in subsections(root, "merge")? {
+            // `false` is a plain shell builtin: a file with a custom driver always conflicts, and no repo code runs.
+            pairs.push((format!("merge.{d}.driver"), "false".into()));
+            pairs.push((format!("merge.{d}.recursive"), "text".into()));
+        }
+    }
+    pairs.extend(extra.iter().cloned());
     let mut env = vec![("GIT_CONFIG_COUNT".to_string(), pairs.len().to_string()), ("GIT_ATTR_NOSYSTEM".into(), "1".into())];
     for (i, (k, v)) in pairs.into_iter().enumerate() {
         env.push((format!("GIT_CONFIG_KEY_{i}"), k));
-        env.push((format!("GIT_CONFIG_VALUE_{i}"), v.to_string()));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), v));
     }
     Ok(env)
+}
+
+/// `git` for amm's own working-tree operations in the integration worktree (reset, merge, clean): on top of the
+/// hardening `git` always has, it runs no filter (clean, smudge, process), no custom merge driver, no signing or
+/// signature check and no automatic gc, and commits as `amm <amm@localhost>`. Blocking.
+pub fn git_checkout(root: &Path, args: &[&str]) -> Result<GitResult, String> {
+    let (name, email) = AMM_IDENT;
+    let extra: Vec<(String, String)> = [
+        ("commit.gpgsign", "false"),
+        ("merge.verifySignatures", "false"),
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
+        ("user.name", name),
+        ("user.email", email),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let mut env = config_env(root, &extra, true)?;
+    // git-lfs is the usual smudge filter; tell it to stay out even where a filter is not reached through config.
+    env.push(("GIT_LFS_SKIP_SMUDGE".into(), "1".into()));
+    for who in ["AUTHOR", "COMMITTER"] {
+        env.push((format!("GIT_{who}_NAME"), name.into()));
+        env.push((format!("GIT_{who}_EMAIL"), email.into()));
+    }
+    run(root, args, &env, MAX_OUTPUT, GIT_TIMEOUT)
 }
 
 /// Files that differ from `base_sha`, relative to the worktree root `root`: changes committed in `base_sha..sha`,
@@ -724,6 +775,31 @@ mod tests {
         let dir = repo();
         fs::write(dir.join(".git/shallow"), format!("{}\n", head(&dir))).unwrap();
         assert!(worktree_info(&dir).unwrap_err().contains("shallow"));
+    }
+
+    #[test]
+    fn git_checkout_runs_no_smudge_filter_or_merge_driver() {
+        let dir = repo();
+        let marker = tmp_dir().join("ran");
+        fs::write(dir.join(".gitattributes"), "* filter=x merge=m\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-qm", "attrs"]);
+        let base = head(&dir);
+        git_in(&dir, &["checkout", "-qb", "side"]);
+        fs::write(dir.join("a.txt"), "side\n").unwrap();
+        git_in(&dir, &["commit", "-qam", "side"]);
+        git_in(&dir, &["checkout", "-q", "main"]);
+        fs::write(dir.join("a.txt"), "main\n").unwrap();
+        git_in(&dir, &["commit", "-qam", "main"]);
+        let touch = format!("touch {}; cat", marker.display());
+        git_in(&dir, &["config", "filter.x.smudge", &touch]);
+        git_in(&dir, &["config", "filter.x.clean", &touch]);
+        git_in(&dir, &["config", "merge.m.driver", &format!("touch {}; true", marker.display())]);
+        let m = git_checkout(&dir, &["merge", "--no-edit", "side"]).unwrap();
+        assert_ne!(m.code, 0, "the neutralised driver makes the file conflict");
+        git_checkout(&dir, &["merge", "--abort"]).unwrap();
+        git_checkout(&dir, &["reset", "-q", "--hard", &base]).unwrap();
+        assert!(!marker.exists(), "a planted smudge filter or merge driver ran");
     }
 
     #[test]

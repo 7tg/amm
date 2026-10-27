@@ -23,7 +23,7 @@ pub const CONFLICT_NOTE: &str = "merge conflict with the integration branch";
 
 /// A fresh run id, for callers that must name the run before `start_run` (the integration worktree).
 pub fn new_run_id() -> String {
-    new_id("r")
+    format!("r{:016x}", rand::random::<u64>())
 }
 
 fn new_id(prefix: &str) -> String {
@@ -1214,7 +1214,7 @@ mod lifecycle_tests {
     fn bind_bases_on_the_recorded_integration_head_never_on_live_refs() {
         let (h, run, _b, repo) = started(DEFAULT_LIMITS);
         let recorded = h.amm.run(&run.id).unwrap().integration_head.unwrap();
-        let iwt = crate::integration::create_worktree(&repo, &run.id, "main").unwrap();
+        let (iwt, _) = crate::integration::create_worktree(&repo, &run.id, "main").unwrap();
         std::fs::write(iwt.join("merged.txt"), "m\n").unwrap();
         git(&iwt, &["add", "."]);
         git(&iwt, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "merged"]);

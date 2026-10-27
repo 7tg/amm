@@ -101,7 +101,7 @@ fn shim_starts_the_daemon_and_exposes_amm_tools_over_mcp() {
         json!({ "name": "amm_run_start", "arguments": { "repo": repo, "test_cmd": "true", "base_branch": "main" } }),
     );
     let text = res["result"]["content"][0]["text"].as_str().unwrap_or_default();
-    let re = regex::Regex::new(r#""run_id":"r[0-9a-f]{6}""#).unwrap();
+    let re = regex::Regex::new(r#""run_id":"r[0-9a-f]{16}""#).unwrap();
     assert!(re.is_match(text), "{res}");
     assert!(read_lock(&s.home).is_some());
 }

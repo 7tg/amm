@@ -3,7 +3,7 @@
 use crate::hooks::{HookInput, try_handle_hook};
 use crate::checks::run_check;
 use crate::git::worktree_info;
-use crate::integration::{create_worktree, integration_branch, remove_worker_worktree};
+use crate::integration::{create_worktree, integration_branch, remove_worker_worktree, verify_clean};
 use crate::service::{
     Amm, AmmError, AmmResult, BriefInput, BriefPatch, StartRun, new_run_id, resolve_base_branch, resolve_repo,
 };
@@ -293,25 +293,33 @@ async fn run_op(s: &AppState, op: &str, body: Value) -> AmmResult<Value> {
             let (setup_cmd, run_id) = (a.setup_cmd.clone().filter(|c| !c.trim().is_empty()), id.clone());
             // Resolve, create the integration worktree and run the setup, all outside the lock.
             let (repo, base_branch, wt, head) = blocking(move || {
-                let repo = resolve_repo(Path::new(&a.repo));
+                let given = resolve_repo(Path::new(&a.repo));
+                let repo = worktree_info(&given)
+                    .map_err(|e| AmmError(format!("{} is not a git repository: {}", given.display(), e.lines().next().unwrap_or(""))))?
+                    .toplevel;
                 let base = match a.base_branch {
                     Some(b) => b,
                     None => resolve_base_branch(&repo)?,
                 };
-                let wt = create_worktree(&repo, &run_id, &base)?;
-                if let Some(cmd) = &setup_cmd {
+                let (wt, head) = create_worktree(&repo, &run_id, &base)?;
+                let branch = integration_branch(&run_id);
+                // From here every failure removes the worktree and its branch again.
+                let set_up = (|| {
+                    let Some(cmd) = &setup_cmd else { return Ok(()) };
                     let r = run_check(cmd, &wt, budget);
                     if !r.ok {
-                        let _ = remove_worker_worktree(&repo, &wt, &integration_branch(&run_id));
                         let how = if r.timed_out { "timed out".to_string() } else { format!("exited {}", r.code.unwrap_or(-1)) };
-                        let tail: String = {
-                            let n = r.output.chars().count();
-                            r.output.chars().skip(n.saturating_sub(1500)).collect()
-                        };
-                        return Err(AmmError(format!("setup_cmd `{cmd}` {how}:\n{tail}")));
+                        let n = r.output.chars().count();
+                        let tail: String = r.output.chars().skip(n.saturating_sub(1500)).collect();
+                        return Err(format!("setup_cmd `{cmd}` {how}:\n{tail}"));
                     }
+                    // setup_cmd runs repo code: the worktree must still be the base commit, changed only in ignored files.
+                    verify_clean(&wt, &branch, &head).map_err(|e| format!("setup_cmd `{cmd}` changed the integration worktree: {e}"))
+                })();
+                if let Err(e) = set_up {
+                    let _ = remove_worker_worktree(&repo, &wt, &branch);
+                    return Err(AmmError(e));
                 }
-                let head = worktree_info(&wt)?.head;
                 Ok((repo, base, wt, head))
             })
             .await?;
@@ -440,19 +448,20 @@ mod tests {
     async fn run_start_creates_the_integration_worktree_at_the_base_commit_and_runs_setup_there() {
         let repo = crate::testutil::init_repo();
         let s = app(make_amm(DEFAULT_LIMITS).amm);
-        let args = json!({ "repo": repo, "test_cmd": "true", "setup_cmd": "touch ready" });
+        let args = json!({ "repo": repo, "test_cmd": "true", "setup_cmd": "mkdir -p .claude && touch .claude/ready" });
         let out = run_op(&s, "run_start", args).await.unwrap();
         let id = out["run_id"].as_str().unwrap().to_string();
         let run = lock(&s.amm).run(&id).unwrap();
         let wt = repo.join(".claude/worktrees").join(format!("amm-{id}"));
         assert_eq!(run.integration_branch, format!("amm/{id}"));
         assert_eq!(run.integration_worktree.as_deref(), Some(wt.to_string_lossy().as_ref()));
-        assert_eq!(run.setup_cmd.as_deref(), Some("touch ready"));
+        assert_eq!(run.setup_cmd.as_deref(), Some("mkdir -p .claude && touch .claude/ready"));
+        assert!(regex::Regex::new(r"^r[0-9a-f]{16}$").unwrap().is_match(&id), "{id}");
         assert_eq!(run.integration_head, rev(&repo, "main"));
         assert_eq!(rev(&repo, &format!("refs/heads/amm/{id}")), rev(&repo, "main"));
         assert_eq!(crate::git::worktree_info(&wt).unwrap().branch, Some(format!("amm/{id}")));
-        assert!(wt.join("ready").exists(), "setup_cmd ran outside the integration worktree");
-        assert!(!repo.join("ready").exists());
+        assert!(wt.join(".claude/ready").exists(), "setup_cmd ran outside the integration worktree");
+        assert!(!repo.join(".claude/ready").exists());
         // Cancelling the run leaves the integration worktree for the user.
         run_op(&s, "cancel", json!({ "id": id })).await.unwrap();
         assert!(wt.exists());
@@ -473,10 +482,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_setup_cmd_that_moves_head_or_leaves_untracked_files_fails_and_cleans_up() {
+        for setup in ["git -c user.email=a@b -c user.name=a commit -q --allow-empty -m x", "touch stray.txt", "git checkout -q -b elsewhere"] {
+            let repo = crate::testutil::init_repo();
+            let s = app(make_amm(DEFAULT_LIMITS).amm);
+            let args = json!({ "repo": repo, "test_cmd": "true", "setup_cmd": setup });
+            let e = run_op(&s, "run_start", args).await.unwrap_err().0;
+            assert!(e.contains("setup_cmd"), "{setup}: {e}");
+            let branches = crate::git::git(&repo, &["branch", "--list", "amm/*"]).unwrap().stdout;
+            assert_eq!(branches.trim(), "", "{setup}");
+            let left = std::fs::read_dir(repo.join(".claude/worktrees")).map(|d| d.count()).unwrap_or(0);
+            assert_eq!(left, 0, "{setup}");
+            assert!(lock(&s.amm).store.all::<crate::types::Run>().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn run_start_outside_a_git_repo_fails() {
         let s = app(make_amm(DEFAULT_LIMITS).amm);
         let args = json!({ "repo": crate::testutil::tmp_dir(), "test_cmd": "true", "base_branch": "main" });
-        assert!(run_op(&s, "run_start", args).await.is_err());
+        let e = run_op(&s, "run_start", args).await.unwrap_err().0;
+        assert!(e.contains("not a git repository"), "{e}");
         assert!(lock(&s.amm).store.all::<crate::types::Run>().is_empty());
     }
 

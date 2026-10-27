@@ -144,7 +144,7 @@ fn is_worker(input: &HookInput) -> bool {
 
 /// Main session: only amm tool calls are forwarded here, to track which sessions use amm.
 fn main_session(state: &Arc<Mutex<Amm>>, event: &str, input: &HookInput) -> AmmResult<Value> {
-    static RUN_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\br[0-9a-f]{6}\b").unwrap());
+    static RUN_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\br(?:[0-9a-f]{16}|[0-9a-f]{6})\b").unwrap());
     let mut amm = lock(state);
     amm.touch_session(&input.session_id, &input.cwd)?;
     if event == "PostToolUse" && input.tool_name.as_deref().is_some_and(|t| t.ends_with("amm_run_start")) {
@@ -1133,7 +1133,7 @@ mod tests {
     /// integration head (as the merge queue leaves it), and a worker that has merged that branch.
     async fn worker_on_integration() -> (Bound, String) {
         let (state, main, repo, run, b, dir) = dispatched_in(&[]);
-        let iwt = crate::integration::create_worktree(&main, &run.id, "main").unwrap();
+        let (iwt, _) = crate::integration::create_worktree(&main, &run.id, "main").unwrap();
         std::fs::create_dir_all(iwt.join("lib")).unwrap();
         std::fs::write(iwt.join("lib/other.ts"), "other\n").unwrap();
         git_in(&iwt, &["add", "."]);
