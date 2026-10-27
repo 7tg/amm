@@ -315,6 +315,9 @@ impl Amm {
             notes: vec![],
             report: None,
             integration_failures: 0,
+            integration_errors: 0,
+            last_integration_error: None,
+            retry_at: 0,
         };
         self.store.put(&b)?;
         self.event(
@@ -821,7 +824,14 @@ impl Amm {
             return Ok(false);
         }
         // The worker has ended and its slot is free; a failed brief write is still reported to the caller.
-        self.store.put(&Brief { state: BriefState::Done, ..b.clone() })?;
+        // A new gated commit: its merge starts with a clean error record.
+        self.store.put(&Brief {
+            state: BriefState::Done,
+            integration_errors: 0,
+            last_integration_error: None,
+            retry_at: 0,
+            ..b.clone()
+        })?;
         self.event("done", Some(&b.run_id), Some(&w.id), serde_json::json!({ "briefId": b.id, "title": b.title }))?;
         Ok(true)
     }

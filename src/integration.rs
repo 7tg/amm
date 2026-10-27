@@ -109,6 +109,33 @@ pub fn remove_worker_worktree(repo: &Path, worktree: &Path, branch: &str) -> Res
     Ok(())
 }
 
+/// The ref that keeps a brief's gated commit alive (worker branches and worktrees get deleted).
+pub fn pin_ref(brief_id: &str) -> String {
+    format!("refs/amm/gated/{brief_id}")
+}
+
+/// Pins `sha` as the brief's gated commit. Blocking.
+pub fn pin_gated(dir: &Path, brief_id: &str, sha: &str) -> Result<(), String> {
+    let r = git(dir, &["update-ref", "-m", "amm: gated", "--end-of-options", &pin_ref(brief_id), sha])?;
+    if r.code != 0 {
+        return Err(fail("could not pin the gated commit", &r.stderr));
+    }
+    Ok(())
+}
+
+/// Drops a brief's pin; a missing pin is fine. Blocking.
+pub fn unpin_gated(dir: &Path, brief_id: &str) -> Result<(), String> {
+    let r = git(dir, &["update-ref", "-d", "--end-of-options", &pin_ref(brief_id)])?;
+    if r.code != 0 {
+        return Err(fail("could not drop the pin", &r.stderr));
+    }
+    Ok(())
+}
+
+/// Errors after which a brief fails, and the first back-off (doubling).
+const MAX_INTEGRATION_ERRORS: u32 = 3;
+const RETRY_MS: i64 = 60_000;
+
 /// Longest test output kept in a brief's notes.
 const NOTE_TAIL: usize = 1500;
 
@@ -153,6 +180,7 @@ struct Job {
     /// `Run.integration_head`: where amm left the branch.
     head: String,
     gated: String,
+    brief_id: String,
     message: String,
     test_cmd: String,
     budget_ms: u64,
@@ -231,6 +259,12 @@ fn merge_one(job: &Job) -> Outcome {
     }
     if rev(wt, &format!("{}^{{commit}}", job.gated)).as_deref() != Some(job.gated.as_str()) {
         return Outcome::Error(format!("commit {} is missing", job.gated));
+    }
+    // The sha amm recorded is what gets merged; the pin only keeps it alive, so a moved pin is put back.
+    if rev(wt, &pin_ref(&job.brief_id)).as_deref() != Some(job.gated.as_str())
+        && let Err(e) = pin_gated(wt, &job.brief_id, &job.gated)
+    {
+        return Outcome::Error(e);
     }
     let mt = git_checkout(
         wt,
@@ -394,7 +428,12 @@ impl Amm {
             .all::<Run>()
             .into_iter()
             .filter(|r| r.state == RunState::Active && view(r).is_some() && !self.merging.contains(&r.id))
-            .filter(|r| self.run_briefs(&r.id).iter().any(|b| matches!(b.state, BriefState::Done | BriefState::Merging)))
+            .filter(|r| {
+                let now = (self.now)();
+                self.run_briefs(&r.id).iter().any(|b| {
+                    (b.state == BriefState::Done && b.retry_at <= now) || b.state == BriefState::Merging
+                })
+            })
             .map(|r| r.id)
             .collect();
         ids.sort();
@@ -403,7 +442,8 @@ impl Amm {
 
     /// Picks the lowest-seq done brief with a gated commit and moves it to merging. None when nothing is left.
     fn next_merge(&mut self, run_id: &str) -> AmmResult<Option<(Brief, Worker)>> {
-        for b in self.run_briefs(run_id).into_iter().filter(|b| b.state == BriefState::Done) {
+        let now = (self.now)();
+        for b in self.run_briefs(run_id).into_iter().filter(|b| b.state == BriefState::Done && b.retry_at <= now) {
             let Some(w) = self.gated_worker(&b.id) else { continue };
             if let Some(b) = self.brief_transition(&b.id, &[BriefState::Done], |x| x.state = BriefState::Merging)? {
                 self.event("merging", Some(run_id), Some(&w.id), json!({ "briefId": b.id, "sha": w.gated_sha }))?;
@@ -493,10 +533,32 @@ impl Amm {
                 Ok(false)
             }
             Outcome::Error(e) => {
-                self.brief_transition(&b.id, &[BriefState::Merging], |x| x.state = BriefState::Done)?;
-                let mut d = ids;
-                d["error"] = json!(e);
-                self.event("integration_error", Some(run_id), Some(&w.id), d)?;
+                let now = (self.now)();
+                let Some(cur) = self.brief_transition(&b.id, &[BriefState::Merging], |x| {
+                    x.integration_errors += 1;
+                    let n = x.integration_errors.min(10);
+                    x.retry_at = now + RETRY_MS * (1 << (n - 1));
+                    x.state = if x.integration_errors >= MAX_INTEGRATION_ERRORS { BriefState::Failed } else { BriefState::Done };
+                })?
+                else {
+                    return Ok(false);
+                };
+                // A repeat of the same error is not news.
+                if cur.last_integration_error.as_deref() != Some(e.as_str()) {
+                    let mut d = ids;
+                    d["error"] = json!(e);
+                    self.event("integration_error", Some(run_id), Some(&w.id), d)?;
+                }
+                let failed = cur.state == BriefState::Failed;
+                let mut notes = cur.notes.clone();
+                if failed {
+                    notes.push(format!("amm could not merge your work {} times: {e}", cur.integration_errors));
+                }
+                self.store.put(&Brief { last_integration_error: Some(e.clone()), notes, ..cur })?;
+                if failed {
+                    let reason = format!("merge failed {MAX_INTEGRATION_ERRORS} times: {}", first_line(e));
+                    self.event("integration_failed", Some(run_id), Some(&w.id), json!({ "briefId": b.id, "reason": reason, "tail": e }))?;
+                }
                 Ok(false)
             }
             Outcome::Diverged(reason) => {
@@ -576,6 +638,7 @@ async fn queue(state: &Arc<Mutex<Amm>>, run_id: &str, claim: &mut Claim) -> Resu
                 branch: v.branch.clone(),
                 head: v.head.clone(),
                 gated: w.gated_sha.clone().unwrap_or_default(),
+                brief_id: b.id.clone(),
                 message: format!("amm: {} ({})", b.title, b.id),
                 test_cmd: v.test_cmd.clone(),
                 budget_ms: amm.limits.gate_budget_ms.max(0) as u64,
@@ -587,18 +650,7 @@ async fn queue(state: &Arc<Mutex<Amm>>, run_id: &str, claim: &mut Claim) -> Resu
         let outcome = blocking(move || merge_one(&job)).await.unwrap_or_else(Outcome::Error);
         let kept = lock(state).record(run_id, &b, &w, &outcome).map_err(|e| e.0);
         match (&outcome, kept) {
-            (Outcome::Merged { .. }, Ok(true)) => {
-                let (repo, wt, branch) = (v.repo.clone(), w.worktree.clone(), w.branch.clone());
-                if let (Some(wt), Some(branch)) = (wt, branch.filter(|b| b.starts_with("worktree-agent-")))
-                    && Path::new(&wt) != v.wt
-                    && Path::new(&wt) != v.repo
-                {
-                    let removed = blocking(move || remove_worker_worktree(&repo, Path::new(&wt), &branch)).await;
-                    if let Err(e) = removed.and_then(|r| r) {
-                        log_err("remove worker worktree", e);
-                    }
-                }
-            }
+            (Outcome::Merged { .. }, Ok(true)) => {}
             (Outcome::Merged { new }, Ok(false)) => {
                 // The brief was cancelled while it merged: take the merge back off the branch.
                 let new = new.clone();
@@ -608,7 +660,7 @@ async fn queue(state: &Arc<Mutex<Amm>>, run_id: &str, claim: &mut Claim) -> Resu
                     return Ok(());
                 }
             }
-            (Outcome::Error(_) | Outcome::Diverged(_), kept) => {
+            (Outcome::Diverged(_), kept) => {
                 kept?;
                 return Ok(());
             }
@@ -616,9 +668,39 @@ async fn queue(state: &Arc<Mutex<Amm>>, run_id: &str, claim: &mut Claim) -> Resu
                 kept?;
             }
         }
+        // Merged, requeued or final: the worker's worktree, branch and pin have served their purpose.
+        let settled = lock(state).brief(&b.id).map(|x| x.state != BriefState::Done).unwrap_or(false);
+        if settled {
+            cleanup(&v, &b.id, &w).await;
+        }
     }
 }
 
+/// Drops a settled brief's pin and removes its worker's worktree and branch (never the integration worktree or the
+/// main checkout, and only `worktree-agent-*` branches). Failures are logged: they leave clutter, not risk.
+async fn cleanup(v: &RunView, brief_id: &str, w: &Worker) {
+    let (repo, iwt, brief_id) = (v.repo.clone(), v.wt.clone(), brief_id.to_string());
+    let (wt, branch) = (w.worktree.clone(), w.branch.clone());
+    let done = blocking(move || {
+        let mut errs = Vec::new();
+        if let Err(e) = unpin_gated(&repo, &brief_id) {
+            errs.push(e);
+        }
+        if let (Some(wt), Some(branch)) = (wt, branch.filter(|b| b.starts_with("worktree-agent-")))
+            && Path::new(&wt) != iwt
+            && Path::new(&wt) != repo
+            && let Err(e) = remove_worker_worktree(&repo, Path::new(&wt), &branch)
+        {
+            errs.push(e);
+        }
+        errs
+    })
+    .await;
+    match done {
+        Ok(errs) => errs.into_iter().for_each(|e| log_err("cleanup", e)),
+        Err(e) => log_err("cleanup", e),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,6 +768,7 @@ mod tests {
 
     struct Q {
         db: PathBuf,
+        clock: crate::testutil::ManualClock,
         state: Arc<Mutex<Amm>>,
         repo: PathBuf,
         run: Run,
@@ -720,7 +803,7 @@ mod tests {
                 setup_cmd: None,
             })
             .unwrap();
-        Q { db: h.dir.join("amm.db"), state: Arc::new(Mutex::new(amm)), repo, run, iwt }
+        Q { db: h.dir.join("amm.db"), clock: h.clock, state: Arc::new(Mutex::new(amm)), repo, run, iwt }
     }
 
     impl Q {
@@ -750,6 +833,7 @@ mod tests {
             work(&wt);
             let parent = sh(&wt, &["rev-parse", "HEAD"]);
             let sha = crate::git::commit_all(&wt, w.branch.as_deref().unwrap(), &parent, "work").unwrap();
+            pin_gated(&wt, &b.id, &sha).unwrap();
             let mut amm = self.amm();
             let w = amm.mark_checking(&w, None).unwrap().unwrap();
             assert!(amm.complete(&w, Some(sha.clone())).unwrap());
@@ -833,7 +917,10 @@ mod tests {
         let (b1, b2) = (q.add("one", "c.txt"), q.add("two", "c.txt"));
         q.run_worker(&b1, |wt| write(wt, "c.txt", "one\n"));
         q.run_worker(&b2, |wt| write(wt, "c.txt", "two\n"));
+        let wt2 = q.amm().store.all::<Worker>().into_iter().find(|w| w.brief_id == b2.id).unwrap().worktree.unwrap();
         q.integrate().await;
+        assert!(!Path::new(&wt2).exists(), "a requeued brief's old worktree must go");
+        assert_eq!(rev(&q.repo, &pin_ref(&b2.id)), None);
         assert_eq!(q.brief(&b1.id).state, BriefState::Merged);
         let after = q.brief(&b2.id);
         assert_eq!(after.state, BriefState::Queued);
@@ -997,6 +1084,53 @@ mod tests {
         assert_eq!(q.fresh_run().integration_head, Some(before));
         assert!(!q.iwt.join("a/x.ts").exists());
         assert_eq!(q.fresh_run().state, RunState::Active);
+    }
+
+    #[tokio::test]
+    async fn a_brief_that_cannot_merge_backs_off_without_blocking_later_briefs_then_fails() {
+        let q = queue_with("true");
+        let (stuck, ok) = (q.add("stuck", "a/**"), q.add("ok", "b/**"));
+        q.run_worker(&stuck, |wt| write(wt, "a/x.ts", "1\n"));
+        q.run_worker(&ok, |wt| write(wt, "b/y.ts", "2\n"));
+        // The gated commit is gone (no object, no pin).
+        {
+            let mut amm = q.amm();
+            let w = amm.store.all::<Worker>().into_iter().find(|w| w.brief_id == stuck.id).unwrap();
+            amm.store.put(&Worker { gated_sha: Some("0".repeat(40)), ..w }).unwrap();
+        }
+        q.integrate().await;
+        assert_eq!(q.brief(&ok.id).state, BriefState::Merged, "a stuck brief must not block the queue");
+        let s = q.brief(&stuck.id);
+        assert_eq!((s.state, s.integration_errors), (BriefState::Done, 1));
+        assert_eq!(q.events("integration_error").len(), 1);
+        // Backing off: an immediate retry does nothing, and the sweep does not even start the queue.
+        q.integrate().await;
+        assert_eq!(q.brief(&stuck.id).integration_errors, 1);
+        assert!(q.amm().runs_to_integrate().is_empty());
+        q.clock.advance(10 * 60 * 1000);
+        assert_eq!(q.amm().runs_to_integrate(), std::slice::from_ref(&q.run.id));
+        q.integrate().await;
+        assert_eq!(q.brief(&stuck.id).integration_errors, 2);
+        assert_eq!(q.events("integration_error").len(), 1, "the same error is reported once");
+        q.clock.advance(10 * 60 * 1000);
+        q.integrate().await;
+        let s = q.brief(&stuck.id);
+        assert_eq!((s.state, s.integration_errors), (BriefState::Failed, 3));
+        assert_eq!(q.events("integration_failed").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_gated_commit_is_pinned_until_the_brief_is_merged() {
+        let q = queue_with("true");
+        let b = q.add("one", "a/**");
+        let g = q.run_worker(&b, |wt| write(wt, "a/x.ts", "1\n"));
+        let pin = format!("refs/amm/gated/{}", b.id);
+        assert_eq!(rev(&q.repo, &pin), Some(g.clone()));
+        // A worker that moves the pin cannot change what is merged.
+        sh(&q.repo, &["update-ref", &pin, &q.tip()]);
+        q.integrate().await;
+        assert_eq!(rev(&q.repo, &format!("{}^2", q.tip())), Some(g));
+        assert_eq!(rev(&q.repo, &pin), None, "the pin outlived the merge");
     }
 
     #[test]

@@ -119,6 +119,15 @@ pub struct Brief {
     /// Times this brief's merge failed the integration tests.
     #[serde(default)]
     pub integration_failures: u32,
+    /// Times the merge queue could not even try this brief's merge (a git error); 3 fail it.
+    #[serde(default)]
+    pub integration_errors: u32,
+    /// The last such error, so a repeat is not reported again.
+    #[serde(default)]
+    pub last_integration_error: Option<String>,
+    /// The merge queue skips the brief until then (ms since the epoch).
+    #[serde(default)]
+    pub retry_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

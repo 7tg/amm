@@ -595,7 +595,11 @@ fn gate_problems(w: &Worker, b: &Brief, gate: &Gate, limits: &Limits, diff: &Dif
     if !problems.is_empty() {
         return (problems, None);
     }
-    match commit_work(w, b, wt, base, branch, &sha, repo) {
+    // Pin the gated commit so the merge queue still has it once the worker's branch is gone.
+    match commit_work(w, b, wt, base, branch, &sha, repo).and_then(|gated| {
+        crate::integration::pin_gated(Path::new(wt), &b.id, &gated).map_err(|e| format!("amm could not pin your commit: {e}"))?;
+        Ok(gated)
+    }) {
         Ok(gated) => (problems, Some(gated)),
         Err(p) => {
             problems.push(p);
@@ -1062,6 +1066,7 @@ mod tests {
         let files = git_in(&h.repo, &["show", "--name-only", "--format=", &head]);
         assert_eq!(files.lines().collect::<Vec<_>>(), ["src/a.ts", "src/b.ts"]);
         assert_eq!(git_in(&h.repo, &["status", "--porcelain"]), "");
+        assert_eq!(git_in(&h.repo, &["rev-parse", &format!("refs/amm/gated/{}", h.b.id)]), head, "the gated commit is pinned");
     }
 
     #[tokio::test]
