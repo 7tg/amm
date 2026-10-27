@@ -1,0 +1,928 @@
+//! Claude Code hook handlers. Each handler locks `Amm` only for synchronous reads and guarded transitions; git and
+//! checks run on the blocking pool with the lock released (see the plan's Concurrency section).
+use crate::checks::run_checks;
+use crate::config::{Limits, tool_name};
+use crate::git::{changed_files, git, worktree_info};
+use crate::rules::{Counters, RuleContext, ToolEvent, Verdict, evaluate, is_edit_tool};
+use crate::scope::in_scope;
+use crate::service::{AmmResult, BindClaim, validate_worktree};
+use crate::types::{Brief, ReportStatus, Run, Worker, WorkerState};
+use regex::Regex;
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+
+use crate::service::Amm;
+
+/// A hook payload as Claude Code sends it. Unknown fields are ignored.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct HookInput {
+    pub session_id: String,
+    pub cwd: String,
+    pub hook_event_name: String,
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_input: Option<Value>,
+    pub tool_response: Option<Value>,
+    pub agent_transcript_path: Option<String>,
+    pub stop_hook_active: Option<bool>,
+}
+
+fn allow() -> Value {
+    json!({})
+}
+
+fn deny(reason: &str) -> Value {
+    json!({ "hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason,
+    } })
+}
+
+fn add_context(event: &str, text: &str) -> Value {
+    json!({ "hookSpecificOutput": { "hookEventName": event, "additionalContext": text } })
+}
+
+fn block_stop(reason: &str) -> Value {
+    json!({ "decision": "block", "reason": reason })
+}
+
+fn lock(state: &Arc<Mutex<Amm>>) -> MutexGuard<'_, Amm> {
+    // A panic in another handler must not take every later hook down with it.
+    state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// JS `String(v ?? '')` for a JSON value.
+fn js_string(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// JS `a ?? b ?? ...` over fields of an object: the first that is present and not null.
+fn first_set<'a>(o: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().filter_map(|k| o.get(*k)).find(|v| !v.is_null())
+}
+
+fn first_line(s: &str) -> &str {
+    s.split('\n').next().unwrap_or("")
+}
+
+/// The last `n` chars of `s` (JS `s.slice(-n)`).
+fn tail(s: &str, n: usize) -> String {
+    let len = s.chars().count();
+    s.chars().skip(len.saturating_sub(n)).collect()
+}
+
+/// Handles one hook event. On an internal error (unknown run or brief, a store failure) it returns `{"error": ...}`,
+/// like the TS handler throwing; use `try_handle_hook` to tell the two apart.
+pub async fn handle_hook(state: &Arc<Mutex<Amm>>, event: &str, input: HookInput) -> Value {
+    match try_handle_hook(state, event, input).await {
+        Ok(v) => v,
+        Err(e) => json!({ "error": e.0 }),
+    }
+}
+
+pub async fn try_handle_hook(state: &Arc<Mutex<Amm>>, event: &str, input: HookInput) -> AmmResult<Value> {
+    let Some(agent_id) = input.agent_id.clone().filter(|a| !a.is_empty()) else {
+        return main_session(state, event, &input);
+    };
+    match event {
+        "SubagentStart" => {
+            if !is_worker(&input) {
+                return Ok(allow());
+            }
+            let brief_get = tool_name("amm_brief_get", &lock(state).env);
+            Ok(add_context(
+                "SubagentStart",
+                &format!(
+                    "You are an amm worker. Before anything else, load {brief_get} with ToolSearch and call it with the token from your prompt."
+                ),
+            ))
+        }
+        "PreToolUse" => pre_tool(state, &agent_id, &input).await,
+        "PostToolUse" | "PostToolUseFailure" => post_tool(state, &agent_id, &input, event),
+        "SubagentStop" => subagent_stop(state, &agent_id, &input).await,
+        _ => Ok(allow()),
+    }
+}
+
+fn is_worker(input: &HookInput) -> bool {
+    input.agent_type.as_deref().is_some_and(|t| t.contains("amm-worker"))
+}
+
+/// Main session: only amm tool calls are forwarded here, to track which sessions use amm.
+fn main_session(state: &Arc<Mutex<Amm>>, event: &str, input: &HookInput) -> AmmResult<Value> {
+    static RUN_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\br[0-9a-f]{6}\b").unwrap());
+    let mut amm = lock(state);
+    amm.touch_session(&input.session_id, &input.cwd)?;
+    if event == "PostToolUse" && input.tool_name.as_deref().is_some_and(|t| t.ends_with("amm_run_start")) {
+        let text = serde_json::to_string(input.tool_response.as_ref().unwrap_or(&Value::String(String::new())))
+            .unwrap_or_default();
+        if let Some(run_id) = RUN_ID.find(&text)
+            && let Some(run) = amm.store.get::<Run>(run_id.as_str())
+        {
+            amm.store.put(&Run { session_id: Some(input.session_id.clone()), ..run })?;
+        }
+    }
+    Ok(allow())
+}
+
+/// The three bind phases: claim under the lock, validate the worktree on the blocking pool, finish under the lock.
+async fn bind(state: &Arc<Mutex<Amm>>, brief_id: &str, agent_id: &str, cwd: &str) -> Result<Worker, String> {
+    let (claimed, repo) = {
+        let mut amm = lock(state);
+        match amm.claim_bind(brief_id, agent_id, Path::new(cwd))? {
+            BindClaim::Bound(w) => return Ok(w),
+            BindClaim::Claimed(w) => {
+                let repo = amm.run(&w.run_id).map(|r| r.repo).map_err(|e| e.0);
+                (w, repo)
+            }
+        }
+    };
+    let check = match repo {
+        Ok(repo) => {
+            let cwd = cwd.to_string();
+            tokio::task::spawn_blocking(move || validate_worktree(Path::new(&repo), Path::new(&cwd)))
+                .await
+                .unwrap_or_else(|e| Err(format!("worktree validation failed: {e}")))
+        }
+        Err(e) => Err(e),
+    };
+    lock(state).finish_bind(&claimed.id, agent_id, check)
+}
+
+async fn pre_tool(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput) -> AmmResult<Value> {
+    let tool = input.tool_name.clone().unwrap_or_default();
+    let ti = input.tool_input.clone().unwrap_or_else(|| json!({}));
+    let token = ti.get("token").and_then(Value::as_str).map(str::to_string);
+    let (found, brief_get) = {
+        let amm = lock(state);
+        (amm.worker_by_agent(agent_id), tool_name("amm_brief_get", &amm.env))
+    };
+    let found = match found {
+        Some(w) => w,
+        None if is_worker(input) => {
+            if tool == brief_get
+                && let Some(token) = &token
+            {
+                match bind(state, token, agent_id, &input.cwd).await {
+                    Ok(w) => w,
+                    Err(e) => return Ok(deny(&format!("amm: {e}. Work from the worktree amm created for you."))),
+                }
+            } else if tool != "ToolSearch" && tool != brief_get {
+                return Ok(deny("amm: fetch your brief first with amm_brief_get"));
+            } else {
+                return Ok(allow());
+            }
+        }
+        None => return Ok(allow()),
+    };
+    let (w, b) = {
+        let mut amm = lock(state);
+        // Re-read: the worker may have moved on while a bind ran without the lock.
+        let found = amm.store.get::<Worker>(&found.id).unwrap_or(found);
+        match found.state {
+            WorkerState::Cancelled => {
+                return Ok(deny("amm: your manager cancelled this brief. Stop now and reply CANCELLED."));
+            }
+            WorkerState::Escalated | WorkerState::Lost | WorkerState::Done | WorkerState::Blocked => {
+                return Ok(deny("amm: this brief was reassigned or is finished. Stop now and reply REASSIGNED."));
+            }
+            _ => {}
+        }
+        if found.base_sha.is_none() && tool != brief_get {
+            return Ok(deny("amm: setting up your brief, retry"));
+        }
+        if tool.contains("amm_")
+            && let Some(token) = &token
+            && *token != found.brief_id
+        {
+            return Ok(deny("amm: that token belongs to another brief. Use only your own token."));
+        }
+        // A checking worker holds a lease stretched by the gate budget; touching it would cut that back.
+        let w = if found.state == WorkerState::Checking { found } else { amm.touch_worker(&found)? };
+        if let Some(correction) = amm.take_correction(&w)? {
+            return Ok(deny(&correction));
+        }
+        let b = amm.brief(&w.brief_id)?;
+        (w, b)
+    };
+    // Resolves paths on disk, so it runs without the lock.
+    if let Some(reason) = forbidden(&w, &b, &tool, &ti) {
+        lock(state).event("deny", Some(&w.run_id), Some(&w.id), json!({ "tool": tool, "reason": reason }))?;
+        return Ok(deny(&reason));
+    }
+    Ok(allow())
+}
+
+/// Node's `path.resolve`: lexical, `..` at the root stays at the root.
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// realpath of the nearest existing ancestor plus the remaining segments; follows dangling symlinks.
+pub fn resolve_real(p: &Path) -> PathBuf {
+    resolve_real_at(&normalize(p), 0)
+}
+
+fn resolve_real_at(p: &Path, depth: u32) -> PathBuf {
+    if let Ok(r) = std::fs::canonicalize(p) {
+        return r;
+    }
+    if depth < 40
+        && std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+        && let Ok(target) = std::fs::read_link(p)
+    {
+        let dir = p.parent().unwrap_or(Path::new("/"));
+        return resolve_real_at(&normalize(&dir.join(target)), depth + 1);
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => resolve_real_at(parent, depth).join(name),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// Why a bound worker may not make this call, if it may not.
+pub fn forbidden(w: &Worker, b: &Brief, tool: &str, ti: &Value) -> Option<String> {
+    static PUSH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bgit\b[^;&|\n]*\b(push|send-pack)\b").unwrap());
+    if tool == "Agent" || tool == "Task" {
+        return Some("amm: workers may not spawn agents. Do the work yourself or report \"blocked\".".into());
+    }
+    if tool == "Bash" && PUSH.is_match(&js_string(ti.get("command"))) {
+        return Some("amm: workers may not push. Your manager merges your branch.".into());
+    }
+    if is_edit_tool(tool)
+        && let Some(wt) = w.worktree.as_deref().filter(|s| !s.is_empty())
+    {
+        let file = js_string(first_set(ti, &["file_path", "notebook_path"]));
+        let root = normalize(Path::new(wt));
+        let abs = resolve_real(&root.join(&file));
+        let Ok(rel) = abs.strip_prefix(&root) else {
+            return Some(format!("amm: {file} is outside your worktree ({wt}). Edit only inside it."));
+        };
+        if rel.components().next() == Some(Component::Normal(".git".as_ref())) {
+            return Some("amm: workers may not edit .git.".into());
+        }
+        if !in_scope(&abs.to_string_lossy(), wt, &b.scope) {
+            return Some(format!(
+                "amm: {} is outside your scope ({}). Do not change it; mention it in your amm_report instead.",
+                rel.to_string_lossy(),
+                b.scope.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+fn bash_failed(response: Option<&Value>) -> bool {
+    let Some(r) = response.filter(|r| r.is_object() || r.is_array()) else { return false };
+    if r.get("is_error") == Some(&Value::Bool(true)) {
+        return true;
+    }
+    first_set(r, &["exitCode", "exit_code", "returnCode"]).and_then(Value::as_f64).is_some_and(|c| c != 0.0)
+}
+
+fn summarize(input: &HookInput, ti: &Value) -> String {
+    let s = if input.tool_name.as_deref() == Some("Bash") {
+        js_string(ti.get("command"))
+    } else {
+        js_string(first_set(ti, &["file_path", "pattern", "query"]))
+    };
+    s.chars().take(160).collect()
+}
+
+fn counters(w: &Worker) -> Counters {
+    Counters {
+        tool_calls: w.tool_calls,
+        since_progress: w.since_progress,
+        last_cmd: w.last_cmd.clone(),
+        last_cmd_fails: w.last_cmd_fails,
+        fired_rules: w.fired_rules.clone(),
+    }
+}
+
+fn post_tool(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput, event: &str) -> AmmResult<Value> {
+    let mut amm = lock(state);
+    let Some(w) = amm.worker_by_agent(agent_id).filter(|w| w.state == WorkerState::Running) else {
+        return Ok(allow());
+    };
+    let b = amm.brief(&w.brief_id)?;
+    let failed = event == "PostToolUseFailure" || bash_failed(input.tool_response.as_ref());
+    let ti = input.tool_input.clone().unwrap_or_else(|| json!({}));
+    let ctx = RuleContext { limits: amm.limits.clone(), max_turns: b.max_turns, checks: b.checks.clone() };
+    let tool_event = ToolEvent { tool: input.tool_name.clone().unwrap_or_default(), input: ti.clone(), failed };
+    let (c, verdict) = evaluate(&counters(&w), &tool_event, &ctx);
+    let updated = amm.update_counters(&w, c)?;
+    let mut detail = Map::new();
+    if let Some(t) = &input.tool_name {
+        detail.insert("tool".into(), json!(t));
+    }
+    detail.insert("failed".into(), json!(failed));
+    detail.insert("summary".into(), json!(summarize(input, &ti)));
+    amm.event("tool", Some(&w.run_id), Some(&w.id), Value::Object(detail))?;
+    match verdict {
+        Verdict::Correct { rule, message } => {
+            amm.event(
+                "correction",
+                Some(&w.run_id),
+                Some(&w.id),
+                json!({ "rule": rule, "message": message, "via": "context" }),
+            )?;
+            Ok(add_context(event, &message))
+        }
+        Verdict::Escalate { rule } => {
+            amm.escalate(&updated, &format!("{rule} rule fired again after a correction"))?;
+            Ok(add_context(event, "amm: you are being replaced by a stronger worker. Stop now and reply REASSIGNED."))
+        }
+        Verdict::Ok => Ok(allow()),
+    }
+}
+
+async fn subagent_stop(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput) -> AmmResult<Value> {
+    let (checking, b, repo, limits, report_tool) = {
+        let mut amm = lock(state);
+        let Some(w) = amm.worker_by_agent(agent_id).filter(|w| w.state == WorkerState::Running) else {
+            return Ok(allow());
+        };
+        let b = amm.brief(&w.brief_id)?;
+        if b.report.as_ref().is_some_and(|r| r.status == ReportStatus::Blocked) {
+            amm.mark_blocked(&w)?;
+            return Ok(allow());
+        }
+        let Some(checking) = amm.mark_checking(&w, input.agent_transcript_path.clone())? else {
+            return Ok(allow());
+        };
+        let repo = amm.run(&checking.run_id)?.repo;
+        (checking, b, repo, amm.limits.clone(), tool_name("amm_report", &amm.env))
+    };
+    let (problems, gated_sha) = {
+        let (w, b, limits) = (checking.clone(), b.clone(), limits.clone());
+        tokio::task::spawn_blocking(move || gate_problems(&w, &b, Path::new(&repo), &limits, &report_tool))
+            .await
+            .unwrap_or_else(|e| (vec![format!("amm could not run the done gate: {e}")], None))
+    };
+    let mut amm = lock(state);
+    if problems.is_empty() {
+        amm.complete(&checking, gated_sha)?;
+        return Ok(allow());
+    }
+    // None: the worker was cancelled or swept while its checks ran; let it stop.
+    let Some(next) = amm.stop_blocked(&checking, &problems)? else { return Ok(allow()) };
+    if next.stop_blocks >= limits.max_stop_blocks {
+        let reason = format!("done gate failed {} times: {}", next.stop_blocks, first_line(&problems[0]));
+        amm.escalate(&next, &reason)?;
+        return Ok(allow());
+    }
+    Ok(block_stop(&format!("amm done gate failed:\n- {}\nFix these, then finish again.", problems.join("\n- "))))
+}
+
+/// The worktree must still be what bind validated; checked before and after the checks run.
+fn verify_worktree(w: &Worker, repo: &Path) -> Option<String> {
+    let (Some(wt), Some(_), Some(branch)) = (w.worktree.as_deref(), w.base_sha.as_deref(), w.branch.as_deref()) else {
+        return Some("amm could not find your worktree or its base commit, so your changes cannot be scope-checked".into());
+    };
+    if !Path::new(wt).exists() {
+        return Some("amm could not find your worktree or its base commit, so your changes cannot be scope-checked".into());
+    }
+    let infos = worktree_info(Path::new(wt)).and_then(|mine| worktree_info(repo).map(|repo| (mine, repo)));
+    match infos {
+        Err(e) => Some(format!("amm could not inspect your worktree: {}", first_line(&e))),
+        Ok((mine, repo)) => {
+            if mine.toplevel != Path::new(wt) || mine.common_dir != repo.common_dir {
+                return Some("your worktree is no longer a worktree of the repository (was .git removed or replaced?)".into());
+            }
+            if mine.branch.as_deref() != Some(branch) {
+                let on = mine.branch.as_deref().unwrap_or("(detached)");
+                return Some(format!("your worktree is on branch {on}, not {branch}. Switch back"));
+            }
+            None
+        }
+    }
+}
+
+/// The done gate's git and check work. Blocking: run it on the blocking pool, without the lock.
+fn gate_problems(w: &Worker, b: &Brief, repo: &Path, limits: &Limits, report_tool: &str) -> (Vec<String>, Option<String>) {
+    let mut problems = Vec::new();
+    if b.report.is_none() {
+        problems.push(format!("you have not called {report_tool} with token \"{}\"", b.id));
+    }
+    let before = verify_worktree(w, repo);
+    if let Some(p) = &before {
+        problems.push(p.clone());
+    }
+    if let Some(wt) = w.worktree.as_deref().filter(|wt| Path::new(wt).exists()) {
+        let timeout = limits.check_timeout_ms.max(0) as u64;
+        let budget = limits.gate_budget_ms.max(0) as u64;
+        for r in run_checks(&b.checks, Path::new(wt), timeout, budget) {
+            if !r.ok {
+                let how = if r.timed_out {
+                    "timed out".to_string()
+                } else {
+                    format!("exited {}", r.code.map_or("null".to_string(), |c| c.to_string()))
+                };
+                problems.push(format!("check `{}` {how}:\n{}", r.cmd, tail(&r.output, 1500)));
+            }
+        }
+    }
+    // Checks run worker-written code, which may have tampered with the worktree: verify again, then diff.
+    let after = if before.is_some() { None } else { verify_worktree(w, repo) };
+    if let Some(a) = &after {
+        problems.push(format!("after the checks: {a}"));
+    }
+    let mut gated_sha = None;
+    if before.is_none() && after.is_none() {
+        // verify_worktree passed, so all three are set.
+        let (wt, base, branch) = (w.worktree.as_deref().unwrap(), w.base_sha.as_deref().unwrap(), w.branch.as_deref().unwrap());
+        let head = git(Path::new(wt), &["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+            .map(|r| r.stdout.trim().to_string())
+            .unwrap_or_default();
+        gated_sha = Some(head).filter(|s| !s.is_empty());
+        if gated_sha.is_none() {
+            problems.push("amm could not read your branch head".into());
+        }
+        match changed_files(Path::new(wt), base, branch) {
+            Ok(files) => {
+                let outside: Vec<String> = files
+                    .into_iter()
+                    .filter(|f| !in_scope(&Path::new(wt).join(f).to_string_lossy(), wt, &b.scope))
+                    .collect();
+                if !outside.is_empty() {
+                    problems.push(format!(
+                        "files changed outside your scope: {}. Revert them and describe the needed change in amm_report instead",
+                        outside.join(", ")
+                    ));
+                }
+            }
+            // Fail closed: an unreadable worktree must not pass the gate.
+            Err(e) => problems.push(format!("amm could not list your changed files: {}", first_line(&e))),
+        }
+    }
+    (problems, gated_sha)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DEFAULT_LIMITS;
+    use crate::service::{BriefInput, StartRun};
+    use crate::testutil::{add_worktree, init_repo_with, make_amm};
+    use crate::types::{Brief, BriefState, Report, ReportStatus, Run, Tier, Worker, WorkerState};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    type State = Arc<Mutex<Amm>>;
+
+    struct Bound {
+        state: State,
+        repo: PathBuf,
+        b: Brief,
+    }
+
+    impl Bound {
+        async fn hook(&self, event: &str, extra: Value) -> Value {
+            let mut base = json!({
+                "session_id": "s", "cwd": self.repo, "agent_id": "ag1", "agent_type": "amm:amm-worker-light",
+                "hook_event_name": event,
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                base[k] = v.clone();
+            }
+            handle_hook(&self.state, event, serde_json::from_value(base).unwrap()).await
+        }
+        fn amm(&self) -> std::sync::MutexGuard<'_, Amm> {
+            self.state.lock().unwrap()
+        }
+        fn report(&self, status: ReportStatus) {
+            let r = Report { status, files: vec![], notes: String::new() };
+            self.amm().report(&self.b.id, r).unwrap();
+        }
+        fn worker(&self) -> Worker {
+            self.amm().worker_by_agent("ag1").unwrap()
+        }
+    }
+
+    fn brief_input(scope: &[&str], checks: &[&str]) -> BriefInput {
+        BriefInput {
+            title: "t".into(),
+            goal: "g".into(),
+            scope: scope.iter().map(|s| s.to_string()).collect(),
+            checks: checks.iter().map(|s| s.to_string()).collect(),
+            tier: Tier::Light,
+            max_turns: None,
+        }
+    }
+
+    fn rand_name() -> String {
+        format!("x{:06x}", rand::random::<u32>() & 0xff_ffff)
+    }
+
+    /// An Amm with a run, one dispatched brief and its worktree, not yet bound.
+    fn dispatched(checks: &[&str]) -> (State, PathBuf, PathBuf, Run, Brief) {
+        let mut h = make_amm(DEFAULT_LIMITS);
+        let main = init_repo_with(&[("src/a.ts", "a\n"), ("README.md", "r\n")]);
+        let repo = add_worktree(&main, &rand_name());
+        let run = h
+            .amm
+            .start_run(StartRun {
+                repo: main.to_string_lossy().into(),
+                test_cmd: "true".into(),
+                base_branch: "main".into(),
+            })
+            .unwrap();
+        let b = h.amm.add_brief(&run.id, brief_input(&["src/**"], checks), BriefState::Queued).unwrap();
+        h.amm.dispatch(&run.id).unwrap();
+        (Arc::new(Mutex::new(h.amm)), main, repo, run, b)
+    }
+
+    async fn bound_worker(checks: &[&str]) -> Bound {
+        let (state, _main, repo, _run, b) = dispatched(checks);
+        let h = Bound { state, repo, b };
+        h.hook("PreToolUse", json!({ "tool_name": "mcp__plugin_amm_amm__amm_brief_get", "tool_input": { "token": h.b.id } }))
+            .await;
+        h
+    }
+
+    fn deny_reason(out: &Value) -> Option<String> {
+        let h = out.get("hookSpecificOutput")?;
+        if h.get("permissionDecision")? != "deny" {
+            return None;
+        }
+        Some(h["permissionDecisionReason"].as_str().unwrap().to_string())
+    }
+
+    fn deny_of(out: &Value) -> String {
+        deny_reason(out).unwrap_or_else(|| panic!("expected a deny, got {out}"))
+    }
+
+    fn reason(out: &Value) -> String {
+        out.get("reason").and_then(Value::as_str).unwrap_or("").to_string()
+    }
+
+    fn p(repo: &Path, rel: &str) -> String {
+        repo.join(rel).to_string_lossy().into_owned()
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let o = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    fn commit_all(dir: &Path, msg: &str) {
+        git_in(dir, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", msg]);
+    }
+
+    async fn raw_hook(state: &State, event: &str, v: Value) -> Value {
+        handle_hook(state, event, serde_json::from_value(v).unwrap()).await
+    }
+
+    #[tokio::test]
+    async fn brief_get_binds_the_agent_to_its_brief() {
+        let h = bound_worker(&[]).await;
+        let w = h.worker();
+        assert_eq!(w.brief_id, h.b.id);
+        assert_eq!(w.worktree.as_deref(), Some(h.repo.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn edits_outside_scope_or_worktree_pushes_and_agent_spawns_are_denied() {
+        let h = bound_worker(&[]).await;
+        let pre = |tool: &str, ti: Value| h.hook("PreToolUse", json!({ "tool_name": tool, "tool_input": ti }));
+        assert_eq!(deny_reason(&pre("Edit", json!({ "file_path": p(&h.repo, "src/a.ts") })).await), None);
+        assert!(deny_of(&pre("Write", json!({ "file_path": p(&h.repo, "README.md") })).await).contains("outside your scope"));
+        assert!(deny_of(&pre("Write", json!({ "file_path": "/etc/x" })).await).contains("outside your worktree"));
+        assert!(deny_of(&pre("Bash", json!({ "command": "git push origin HEAD" })).await).contains("may not push"));
+        assert!(deny_of(&pre("Agent", json!({})).await).contains("spawn agents"));
+        assert!(deny_of(&pre("Write", json!({ "file_path": p(&h.repo, ".git/config") })).await).contains("may not edit .git"));
+    }
+
+    #[tokio::test]
+    async fn a_manager_nudge_is_delivered_once_by_denying_the_next_call() {
+        let h = bound_worker(&[]).await;
+        h.amm().nudge(&h.b.id, "stop").unwrap();
+        let read = || h.hook("PreToolUse", json!({ "tool_name": "Read", "tool_input": {} }));
+        assert!(deny_of(&read().await).contains("from your manager): stop"));
+        assert_eq!(deny_reason(&read().await), None);
+    }
+
+    #[tokio::test]
+    async fn post_tool_rules_add_context_then_escalate_and_stop_the_worker() {
+        let h = bound_worker(&[]).await;
+        let fail = || h.hook("PostToolUseFailure", json!({ "tool_name": "Bash", "tool_input": { "command": "make" } }));
+        fail().await;
+        fail().await;
+        let third = fail().await;
+        assert!(third.to_string().contains("failed 3 times"), "{third}");
+        assert_eq!(third["hookSpecificOutput"]["hookEventName"], "PostToolUseFailure");
+        fail().await;
+        fail().await;
+        fail().await;
+        assert_eq!(h.amm().brief(&h.b.id).unwrap().tier, Tier::Standard);
+        let out = h.hook("PreToolUse", json!({ "tool_name": "Read", "tool_input": {} })).await;
+        assert!(deny_of(&out).contains("reassigned"));
+    }
+
+    #[tokio::test]
+    async fn done_gate_blocks_without_a_report_or_with_out_of_scope_changes_then_passes() {
+        let h = bound_worker(&["test -f src/b.ts"]).await;
+        let stop = || h.hook("SubagentStop", json!({ "agent_transcript_path": "/t.jsonl", "stop_hook_active": false }));
+        let out = stop().await;
+        assert_eq!(out["decision"], "block");
+        assert!(reason(&out).contains("not called mcp__plugin_amm_amm__amm_report"), "{out}");
+        assert!(reason(&out).contains("check `test -f src/b.ts` exited 1"), "{out}");
+        std::fs::write(h.repo.join("README.md"), "changed\n").unwrap();
+        std::fs::write(h.repo.join("src/b.ts"), "b\n").unwrap();
+        let r = Report { status: ReportStatus::Done, files: vec!["src/b.ts".into()], notes: String::new() };
+        h.amm().report(&h.b.id, r).unwrap();
+        let out = stop().await;
+        assert!(reason(&out).contains("outside your scope: README.md"), "{out}");
+        std::fs::write(h.repo.join("README.md"), "r\n").unwrap();
+        assert_eq!(stop().await, json!({}));
+        assert_eq!(h.amm().brief(&h.b.id).unwrap().state, BriefState::Done);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_report_ends_the_worker_without_running_checks() {
+        let h = bound_worker(&["false"]).await;
+        let r = Report { status: ReportStatus::Blocked, files: vec![], notes: "api missing".into() };
+        h.amm().report(&h.b.id, r).unwrap();
+        assert_eq!(h.hook("SubagentStop", json!({})).await, json!({}));
+        assert_eq!(h.amm().brief(&h.b.id).unwrap().state, BriefState::Blocked);
+    }
+
+    #[tokio::test]
+    async fn three_failed_gates_escalate() {
+        let h = bound_worker(&["false"]).await;
+        h.report(ReportStatus::Done);
+        assert_eq!(h.hook("SubagentStop", json!({})).await["decision"], "block");
+        h.hook("SubagentStop", json!({})).await;
+        assert_eq!(h.hook("SubagentStop", json!({})).await, json!({}));
+        assert_eq!(h.amm().brief(&h.b.id).unwrap().tier, Tier::Standard);
+    }
+
+    #[tokio::test]
+    async fn events_from_agents_amm_does_not_know_are_allowed_untouched() {
+        let state = Arc::new(Mutex::new(make_amm(DEFAULT_LIMITS).amm));
+        let out = raw_hook(
+            &state,
+            "PreToolUse",
+            json!({ "session_id": "s", "cwd": "/", "hook_event_name": "PreToolUse", "agent_id": "other",
+                    "tool_name": "Bash", "tool_input": { "command": "git push" } }),
+        )
+        .await;
+        assert_eq!(out, json!({}));
+    }
+
+    #[tokio::test]
+    async fn brief_get_from_the_main_checkout_is_refused() {
+        let (state, main, _repo, _run, b) = dispatched(&[]);
+        let out = raw_hook(
+            &state,
+            "PreToolUse",
+            json!({ "session_id": "s", "cwd": main, "hook_event_name": "PreToolUse", "agent_id": "ag1",
+                    "agent_type": "amm:amm-worker-light", "tool_name": "mcp__plugin_amm_amm__amm_brief_get",
+                    "tool_input": { "token": b.id } }),
+        )
+        .await;
+        let r = deny_of(&out);
+        assert!(r.starts_with("amm: ") && r.ends_with("Work from the worktree amm created for you."), "{r}");
+        assert_eq!(state.lock().unwrap().worker_by_agent("ag1"), None);
+    }
+
+    #[tokio::test]
+    async fn an_unbound_amm_worker_may_only_fetch_its_brief_other_subagents_are_untouched() {
+        let h = bound_worker(&[]).await;
+        let call = |agent_type: &str, tool_name: &str| {
+            raw_hook(
+                &h.state,
+                "PreToolUse",
+                json!({ "session_id": "s", "cwd": h.repo, "hook_event_name": "PreToolUse", "agent_id": "ag9",
+                        "agent_type": agent_type, "tool_name": tool_name,
+                        "tool_input": { "file_path": p(&h.repo, "src/a.ts") } }),
+            )
+        };
+        assert!(deny_of(&call("amm:amm-worker-light", "Edit").await).contains("fetch your brief first with amm_brief_get"));
+        assert_eq!(deny_reason(&call("amm:amm-worker-light", "ToolSearch").await), None);
+        assert_eq!(call("general-purpose", "Edit").await, json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_bound_worker_cannot_use_another_brief_token() {
+        let h = bound_worker(&[]).await;
+        let out = h
+            .hook("PreToolUse", json!({ "tool_name": "mcp__plugin_amm_amm__amm_report", "tool_input": { "token": "bother" } }))
+            .await;
+        assert!(deny_of(&out).contains("token"));
+        assert_eq!(deny_reason(&h.hook("PreToolUse", json!({ "tool_name": "Read", "tool_input": {} })).await), None);
+    }
+
+    #[tokio::test]
+    async fn edits_through_a_symlink_that_leaves_the_worktree_are_denied() {
+        let h = bound_worker(&[]).await;
+        let outside = crate::testutil::tmp_dir().canonicalize().unwrap();
+        std::os::unix::fs::symlink(&outside, h.repo.join("src/l")).unwrap();
+        let out = h.hook("PreToolUse", json!({ "tool_name": "Edit", "tool_input": { "file_path": p(&h.repo, "src/l/x") } })).await;
+        assert!(deny_of(&out).contains("outside your worktree"));
+        std::os::unix::fs::symlink(outside.join("nope"), h.repo.join("src/dangling")).unwrap();
+        let out =
+            h.hook("PreToolUse", json!({ "tool_name": "Write", "tool_input": { "file_path": p(&h.repo, "src/dangling") } })).await;
+        assert!(deny_of(&out).contains("outside your worktree"));
+    }
+
+    #[tokio::test]
+    async fn git_push_is_denied_with_options_before_the_subcommand() {
+        let h = bound_worker(&[]).await;
+        for command in ["git -C . push", "git -c a=b push origin", "git send-pack x", "cd x && git push"] {
+            let out = h.hook("PreToolUse", json!({ "tool_name": "Bash", "tool_input": { "command": command } })).await;
+            assert!(deny_of(&out).contains("may not push"), "{command}");
+        }
+        let out =
+            h.hook("PreToolUse", json!({ "tool_name": "Bash", "tool_input": { "command": "git status; echo push" } })).await;
+        assert_eq!(deny_reason(&out), None);
+    }
+
+    #[tokio::test]
+    async fn the_gate_fails_closed_when_the_worktree_is_no_longer_a_worktree() {
+        let h = bound_worker(&[]).await;
+        h.report(ReportStatus::Done);
+        std::fs::remove_file(h.repo.join(".git")).unwrap();
+        let out = h.hook("SubagentStop", json!({})).await;
+        assert_eq!(out["decision"], "block");
+        assert!(reason(&out).contains("worktree"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn the_gate_fails_when_the_branch_was_switched() {
+        let h = bound_worker(&[]).await;
+        h.report(ReportStatus::Done);
+        git_in(&h.repo, &["checkout", "-q", "-b", "other"]);
+        let out = h.hook("SubagentStop", json!({})).await;
+        assert!(reason(&out).contains("branch"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn files_touched_by_the_done_checks_count_toward_the_scope_check() {
+        let h = bound_worker(&["echo x > README.md"]).await;
+        h.report(ReportStatus::Done);
+        let out = h.hook("SubagentStop", json!({})).await;
+        assert!(reason(&out).contains("outside your scope: README.md"), "{out}");
+    }
+
+    async fn sabotage(kind: &str) {
+        let h = bound_worker(&[]).await;
+        let base_sha = h.worker().base_sha.unwrap();
+        let check = if kind == "rm .git" { "rm .git".to_string() } else { format!("git checkout -q --detach {base_sha}") };
+        {
+            let mut amm = h.amm();
+            let b = amm.brief(&h.b.id).unwrap();
+            amm.store.put(&Brief { checks: vec![check], ..b }).unwrap();
+        }
+        std::fs::write(h.repo.join("README.md"), "evil\n").unwrap();
+        commit_all(&h.repo, "evil");
+        h.report(ReportStatus::Done);
+        let out = h.hook("SubagentStop", json!({})).await;
+        assert_eq!(out["decision"], "block");
+        assert!(reason(&out).contains("after the checks"), "{out}");
+        assert_ne!(h.amm().brief(&h.b.id).unwrap().state, BriefState::Done);
+    }
+
+    #[tokio::test]
+    async fn a_check_that_runs_rm_git_cannot_hide_a_committed_out_of_scope_change() {
+        sabotage("rm .git").await;
+    }
+
+    #[tokio::test]
+    async fn a_check_that_runs_detach_cannot_hide_a_committed_out_of_scope_change() {
+        sabotage("detach").await;
+    }
+
+    #[tokio::test]
+    async fn a_committed_out_of_scope_change_is_listed_even_when_the_checks_leave_the_worktree_intact() {
+        let h = bound_worker(&["true"]).await;
+        std::fs::write(h.repo.join("README.md"), "evil\n").unwrap();
+        commit_all(&h.repo, "evil");
+        h.report(ReportStatus::Done);
+        let out = h.hook("SubagentStop", json!({})).await;
+        assert!(reason(&out).contains("outside your scope: README.md"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn while_validation_is_in_progress_a_bound_worker_may_only_call_amm_brief_get() {
+        let h = bound_worker(&[]).await;
+        let w = h.worker();
+        h.amm().store.put(&Worker { base_sha: None, ..w.clone() }).unwrap();
+        let out = h.hook("PreToolUse", json!({ "tool_name": "Read", "tool_input": {} })).await;
+        assert!(deny_of(&out).contains("setting up your brief, retry"));
+        let out = h
+            .hook(
+                "PreToolUse",
+                json!({ "tool_name": "mcp__plugin_amm_amm__amm_brief_get", "tool_input": { "token": w.brief_id } }),
+            )
+            .await;
+        assert_eq!(deny_reason(&out), None);
+    }
+
+    #[tokio::test]
+    async fn only_the_exact_amm_brief_get_tool_name_is_allowed_before_binding() {
+        let h = bound_worker(&[]).await;
+        let out = raw_hook(
+            &h.state,
+            "PreToolUse",
+            json!({ "session_id": "s", "cwd": h.repo, "hook_event_name": "PreToolUse", "agent_id": "ag9",
+                    "agent_type": "amm:amm-worker-light", "tool_name": "evil__amm_brief_get", "tool_input": { "token": "x" } }),
+        )
+        .await;
+        assert!(deny_of(&out).contains("fetch your brief first"));
+    }
+
+    #[tokio::test]
+    async fn completion_records_the_verified_branch_head_as_gated_sha() {
+        let h = bound_worker(&[]).await;
+        std::fs::write(h.repo.join("src/b.ts"), "b\n").unwrap();
+        git_in(&h.repo, &["add", "."]);
+        git_in(&h.repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "work"]);
+        let r = Report { status: ReportStatus::Done, files: vec!["src/b.ts".into()], notes: String::new() };
+        h.amm().report(&h.b.id, r).unwrap();
+        assert_eq!(h.hook("SubagentStop", json!({})).await, json!({}));
+        let w = h.worker();
+        assert_eq!(w.state, WorkerState::Done);
+        assert_eq!(w.gated_sha, Some(git_in(&h.repo, &["rev-parse", w.branch.as_deref().unwrap()])));
+    }
+
+    // Not in the TS suite: the TS event loop serialised binds; here two hooks race on a multi-threaded runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_binds_on_one_brief_bind_exactly_one_agent() {
+        let (state, _main, repo, _run, b) = dispatched(&[]);
+        let bind = |agent: &str| {
+            let state = state.clone();
+            let v = json!({ "session_id": "s", "cwd": repo, "hook_event_name": "PreToolUse", "agent_id": agent,
+                            "agent_type": "amm:amm-worker-light", "tool_name": "mcp__plugin_amm_amm__amm_brief_get",
+                            "tool_input": { "token": b.id } });
+            tokio::spawn(async move { handle_hook(&state, "PreToolUse", serde_json::from_value(v).unwrap()).await })
+        };
+        let (a, c) = (bind("agA"), bind("agB"));
+        let outs = [a.await.unwrap(), c.await.unwrap()];
+        assert_eq!(outs.iter().filter(|o| deny_reason(o).is_none()).count(), 1, "{outs:?}");
+        let amm = state.lock().unwrap();
+        let bound: Vec<_> = ["agA", "agB"].iter().filter_map(|a| amm.worker_by_agent(a)).collect();
+        assert_eq!(bound.len(), 1);
+        assert!(bound[0].base_sha.is_some());
+    }
+
+    // Not in the TS suite: the main session touches its session and links the run it started.
+    #[tokio::test]
+    async fn the_main_session_is_touched_and_linked_to_the_run_it_starts() {
+        let (state, main, _repo, run, _b) = dispatched(&[]);
+        let out = raw_hook(
+            &state,
+            "PostToolUse",
+            json!({ "session_id": "sess1", "cwd": main, "hook_event_name": "PostToolUse",
+                    "tool_name": "mcp__plugin_amm_amm__amm_run_start", "tool_response": [{ "type": "text", "text": format!("run {} started", run.id) }] }),
+        )
+        .await;
+        assert_eq!(out, json!({}));
+        let amm = state.lock().unwrap();
+        assert!(amm.store.get::<crate::types::Session>("sess1").is_some());
+        assert_eq!(amm.run(&run.id).unwrap().session_id.as_deref(), Some("sess1"));
+    }
+
+    // Not in the TS suite: SubagentStart context goes only to amm workers.
+    #[tokio::test]
+    async fn subagent_start_gives_amm_workers_their_first_step() {
+        let state = Arc::new(Mutex::new(make_amm(DEFAULT_LIMITS).amm));
+        let start = |agent_type: &str| {
+            raw_hook(
+                &state,
+                "SubagentStart",
+                json!({ "session_id": "s", "cwd": "/", "hook_event_name": "SubagentStart", "agent_id": "a", "agent_type": agent_type }),
+            )
+        };
+        let out = start("amm:amm-worker-light").await;
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "SubagentStart");
+        assert!(out["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("mcp__plugin_amm_amm__amm_brief_get"));
+        assert_eq!(start("general-purpose").await, json!({}));
+    }
+
+    #[test]
+    fn handle_hook_futures_are_send() {
+        fn send<T: Send>(_: &T) {}
+        let state = Arc::new(Mutex::new(make_amm(DEFAULT_LIMITS).amm));
+        let f = handle_hook(&state, "PreToolUse", HookInput::default());
+        send(&f);
+    }
+}

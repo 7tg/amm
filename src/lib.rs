@@ -1,6 +1,7 @@
 pub mod checks;
 pub mod config;
 pub mod git;
+pub mod hooks;
 pub mod plan_import;
 pub mod rules;
 pub mod scope;
