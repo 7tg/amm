@@ -1,7 +1,11 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::io::Read;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct GitResult {
@@ -13,11 +17,19 @@ pub struct GitResult {
 /// Output cap per stream; a worker could plant a huge file, and the daemon must not buffer it all.
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 
+/// Default kill timeout for one git call.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Runs git in `cwd` with repo-controlled code paths neutralised (replace refs, fsmonitor, hooks) that a worker
 /// could plant. Blocking; async callers use `spawn_blocking`. A spawn failure is code 1 with the error as stderr.
-/// Errs if stdout or stderr exceeds 16 MiB (the child is killed).
+/// Errs if stdout or stderr exceeds 16 MiB, or if git runs longer than `GIT_TIMEOUT` (its process group is killed).
 pub fn git(cwd: &Path, args: &[&str]) -> Result<GitResult, String> {
-    git_capped(cwd, args, MAX_OUTPUT)
+    git_timeout(cwd, args, GIT_TIMEOUT)
+}
+
+/// `git` with a per-call kill timeout.
+pub fn git_timeout(cwd: &Path, args: &[&str], timeout: Duration) -> Result<GitResult, String> {
+    run(cwd, args, &[], MAX_OUTPUT, timeout)
 }
 
 fn read_capped<R: Read>(r: R, max: usize) -> std::io::Result<(Vec<u8>, bool)> {
@@ -27,12 +39,25 @@ fn read_capped<R: Read>(r: R, max: usize) -> std::io::Result<(Vec<u8>, bool)> {
     Ok((buf, over))
 }
 
+#[cfg(test)]
 fn git_capped(cwd: &Path, args: &[&str], max: usize) -> Result<GitResult, String> {
+    run(cwd, args, &[], max, GIT_TIMEOUT)
+}
+
+fn killpg(pgid: u32) {
+    // SAFETY: plain syscall; the group leader is not reaped yet, so its pid (the pgid) cannot have been reused.
+    unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
+}
+
+fn run(cwd: &Path, args: &[&str], env: &[(String, String)], max: usize, timeout: Duration) -> Result<GitResult, String> {
     let spawned = Command::new("git")
         .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"])
         .args(args)
         .current_dir(cwd)
         .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        // Own process group, so a timeout also kills filters or helpers git started.
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -41,21 +66,41 @@ fn git_capped(cwd: &Path, args: &[&str], max: usize) -> Result<GitResult, String
         Ok(c) => c,
         Err(e) => return Ok(GitResult { code: 1, stdout: String::new(), stderr: e.to_string() }),
     };
+    let pid = child.id();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let watchdog = {
+        let timed_out = timed_out.clone();
+        std::thread::spawn(move || {
+            if done_rx.recv_timeout(timeout) == Err(mpsc::RecvTimeoutError::Timeout) {
+                timed_out.store(true, Ordering::SeqCst);
+                killpg(pid);
+            }
+        })
+    };
     let err_pipe = child.stderr.take().ok_or("no stderr pipe")?;
     let out_pipe = child.stdout.take().ok_or("no stdout pipe")?;
     let err_thread = std::thread::spawn(move || read_capped(err_pipe, max));
     let out = read_capped(out_pipe, max);
     if matches!(out, Ok((_, true))) {
-        let _ = child.kill();
+        killpg(pid);
     }
     // Reading stdout to EOF (or killing) lets stderr finish, then the child can be reaped.
-    let err = err_thread.join().map_err(|_| "git stderr reader panicked".to_string())?;
-    let (stdout, out_over) = out.map_err(|e| e.to_string())?;
-    let (stderr, err_over) = err.map_err(|e| e.to_string())?;
-    if out_over || err_over {
-        let _ = child.kill();
+    let err = err_thread.join().map_err(|_| "git stderr reader panicked".to_string());
+    // Stop the watchdog before reaping, so it can never signal a reused pid.
+    drop(done_tx);
+    let _ = watchdog.join();
+    let name = args.first().copied().unwrap_or("");
+    if timed_out.load(Ordering::SeqCst) {
         let _ = child.wait();
-        return Err(format!("git {} output exceeds {max} bytes", args.first().copied().unwrap_or("")));
+        return Err(format!("git {name} timed out after {} ms", timeout.as_millis()));
+    }
+    let (stdout, out_over) = out.map_err(|e| e.to_string())?;
+    let (stderr, err_over) = err?.map_err(|e| e.to_string())?;
+    if out_over || err_over {
+        killpg(pid);
+        let _ = child.wait();
+        return Err(format!("git {name} output exceeds {max} bytes"));
     }
     let status = child.wait().map_err(|e| e.to_string())?;
     Ok(GitResult {
@@ -101,15 +146,42 @@ pub fn worktree_info(cwd: &Path) -> Result<WorktreeInfo, String> {
     Ok(WorktreeInfo { toplevel, common_dir, branch, head })
 }
 
-/// Files that differ from `base_sha`, relative to the worktree root `root`: changes committed on `branch`, staged and
-/// unstaged changes against HEAD, and untracked files. Uses `root` as is (no repo discovery), so a worker cannot
-/// redirect it. Renames are a deletion plus an addition. Errors if git fails.
-pub fn changed_files(root: &Path, base_sha: &str, branch: &str) -> Result<Vec<String>, String> {
-    let branch_ref = format!("refs/heads/{branch}");
+/// Env that turns every configured filter driver off (`clean`, `process` empty, `required` false), so hashing the
+/// working tree runs no repo-planted command. Attributes can come from the tree, .git/info/attributes or config, so
+/// the drivers themselves are disabled; env config outranks every config file and takes any subsection name.
+fn no_filters(root: &Path) -> Result<Vec<(String, String)>, String> {
+    let r = git(root, &["config", "--name-only", "--get-regexp", r"^filter\."])?;
+    if r.code > 1 {
+        return Err(format!("git config failed: {}", r.stderr.trim()));
+    }
+    let mut drivers: Vec<&str> =
+        r.stdout.lines().filter_map(|l| l.strip_prefix("filter.")?.rsplit_once('.').map(|(d, _)| d)).collect();
+    drivers.sort();
+    drivers.dedup();
+    let pairs: Vec<(String, &str)> = drivers
+        .iter()
+        .flat_map(|d| [(format!("filter.{d}.clean"), ""), (format!("filter.{d}.process"), ""), (format!("filter.{d}.required"), "false")])
+        .collect();
+    let mut env = vec![("GIT_CONFIG_COUNT".to_string(), pairs.len().to_string()), ("GIT_ATTR_NOSYSTEM".into(), "1".into())];
+    for (i, (k, v)) in pairs.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), k));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), v.to_string()));
+    }
+    Ok(env)
+}
+
+/// Files that differ from `base_sha`, relative to the worktree root `root`: changes committed in `base_sha..sha`,
+/// staged and unstaged changes against HEAD, and untracked files. `sha` is the exact commit being gated, not a branch
+/// name, so a branch that moves afterwards cannot change what was diffed. Uses `root` as is (no repo discovery), so a
+/// worker cannot redirect it, and runs no filter, textconv or external diff. Renames are a deletion plus an
+/// addition. Errors if git fails or times out.
+pub fn changed_files(root: &Path, base_sha: &str, sha: &str) -> Result<Vec<String>, String> {
+    let env = no_filters(root)?;
+    let diff = ["diff", "--name-only", "-z", "--no-renames", "--no-textconv", "--no-ext-diff"];
     let lists = [
-        raw(root, &["diff", "--name-only", "-z", "--no-renames", base_sha, &branch_ref, "--"])?,
-        raw(root, &["diff", "--name-only", "-z", "--no-renames", "HEAD", "--"])?,
-        raw(root, &["ls-files", "--others", "--exclude-standard", "--full-name", "-z"])?,
+        raw_env(root, &[&diff[..], &[base_sha, sha, "--"]].concat(), &env)?,
+        raw_env(root, &[&diff[..], &["HEAD", "--"]].concat(), &env)?,
+        raw_env(root, &["ls-files", "--others", "--exclude-standard", "--full-name", "-z"], &env)?,
     ];
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -119,6 +191,14 @@ pub fn changed_files(root: &Path, base_sha: &str, branch: &str) -> Result<Vec<St
         }
     }
     Ok(out)
+}
+
+fn raw_env(cwd: &Path, args: &[&str], env: &[(String, String)]) -> Result<String, String> {
+    let r = run(cwd, args, env, MAX_OUTPUT, GIT_TIMEOUT)?;
+    if r.code != 0 {
+        return Err(format!("git {} failed: {}", args.first().copied().unwrap_or(""), r.stderr.trim()));
+    }
+    Ok(r.stdout)
 }
 
 #[cfg(test)]
@@ -289,5 +369,57 @@ mod tests {
         assert!(big.unwrap_err().contains("exceeds"));
         let ok = git_capped(&dir, &["show", "HEAD:a.txt"], 2).unwrap();
         assert_eq!(ok.stdout, "a\n");
+    }
+
+    /// Plants a filter driver `x` whose clean and process commands touch `marker`, applied to every file through
+    /// both an in-tree .gitattributes and .git/info/attributes, then dirties a.txt's stat so git must hash it.
+    fn plant_filter(dir: &Path, marker: &Path, clean: &str) {
+        fs::write(dir.join(".gitattributes"), "* filter=x\n").unwrap();
+        fs::create_dir_all(dir.join(".git/info")).unwrap();
+        fs::write(dir.join(".git/info/attributes"), "* filter=x\n").unwrap();
+        git_in(dir, &["config", "filter.x.clean", clean]);
+        git_in(dir, &["config", "filter.x.process", &format!("sh -c 'touch {}'", marker.display())]);
+        git_in(dir, &["config", "filter.x.required", "true"]);
+        fs::write(dir.join("a.txt"), "changed\n").unwrap();
+    }
+
+    #[test]
+    fn changed_files_never_runs_planted_clean_or_process_filters() {
+        let dir = repo();
+        let base = head(&dir);
+        let marker = tmp_dir().join("ran");
+        plant_filter(&dir, &marker, &format!("touch {}; cat", marker.display()));
+        // precondition: an unhardened working-tree diff runs the filter
+        Command::new("git").args(["diff", "--name-only", "HEAD"]).current_dir(&dir).output().unwrap();
+        assert!(marker.exists(), "filter precondition");
+        fs::remove_file(&marker).unwrap();
+        fs::write(dir.join("a.txt"), "changed again\n").unwrap();
+        let files = sorted(changed_files(&dir, &base, &base).unwrap());
+        assert_eq!(files, [".gitattributes", "a.txt"]);
+        assert!(!marker.exists(), "planted filter ran");
+    }
+
+    #[test]
+    fn git_times_out_and_kills_a_hung_command() {
+        let dir = repo();
+        plant_filter(&dir, &tmp_dir().join("ran"), "sleep 30");
+        git_in(&dir, &["config", "filter.x.process", "sleep 30"]);
+        let t = std::time::Instant::now();
+        let e = git_timeout(&dir, &["diff", "--name-only", "HEAD"], std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn changed_files_diffs_the_given_sha_not_the_branch_head() {
+        let dir = repo();
+        let base = head(&dir);
+        fs::write(dir.join("a.txt"), "1\n").unwrap();
+        git_in(&dir, &["commit", "-qam", "one"]);
+        let one = head(&dir);
+        fs::write(dir.join("z.txt"), "z\n").unwrap();
+        git_in(&dir, &["add", "z.txt"]);
+        git_in(&dir, &["commit", "-qm", "two"]);
+        assert_eq!(changed_files(&dir, &base, &one).unwrap(), ["a.txt"]);
     }
 }
