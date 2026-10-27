@@ -45,14 +45,14 @@ export async function worktreeInfo(cwd: string): Promise<WorktreeInfo> {
   return { toplevel, commonDir, branch: b.code === 0 && b.stdout.trim() ? b.stdout.trim() : null, head };
 }
 
-/** Files that differ from `baseSha`, relative to the worktree root: committed changes, staged and unstaged
- * changes, and untracked files. Renames are reported as a deletion plus an addition. Throws if git fails. */
-export async function changedFiles(cwd: string, baseSha: string): Promise<string[]> {
-  const root = await must(cwd, ['rev-parse', '--show-toplevel']);
+/** Files that differ from `baseSha`, relative to the worktree root `root`: changes committed on `branch`, staged and
+ * unstaged changes against HEAD, and untracked files. Uses `root` as is (no repo discovery), so a worker cannot
+ * redirect it. Renames are a deletion plus an addition. Throws if git fails. */
+export async function changedFiles(root: string, baseSha: string, branch: string): Promise<string[]> {
   const lists = await Promise.all([
-    raw(root, ['diff', '--name-only', '-z', '--no-renames', baseSha, 'HEAD']),
-    raw(root, ['diff', '--name-only', '-z', '--no-renames', 'HEAD']),
-    raw(root, ['ls-files', '--others', '--exclude-standard', '-z']),
+    raw(root, ['diff', '--name-only', '-z', '--no-renames', baseSha, `refs/heads/${branch}`, '--']),
+    raw(root, ['diff', '--name-only', '-z', '--no-renames', 'HEAD', '--']),
+    raw(root, ['ls-files', '--others', '--exclude-standard', '--full-name', '-z']),
   ]);
   return [...new Set(lists.flatMap((l) => l.split('\0')).filter(Boolean))];
 }

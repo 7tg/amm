@@ -312,7 +312,8 @@ export class Amm {
     if (!claimed) return { error: `brief ${briefId} has no unbound worker` };
     this.sem.tryAcquire('workers', w.id, Infinity, this.limits.leaseMs);
     const refuse = (error: string) => {
-      this.putWorker(w, { agentId: null, worktree: null, state: 'starting' });
+      // Guarded: a cancel that landed while we validated must stay cancelled.
+      this.transition(w, ['running'], { agentId: null, worktree: null, state: 'starting' });
       this.event('bind_refused', w.runId, w.id, { briefId, agentId, cwd, error });
       return { error };
     };

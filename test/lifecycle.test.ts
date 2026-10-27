@@ -51,7 +51,7 @@ test('commits made before bind stay in the base..HEAD diff', async () => {
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'early'], { cwd: wt });
   const r = await amm.bind(b.id, 'agent-1', wt);
   assert.ok('worker' in r);
-  assert.deepEqual(await changedFiles(wt, r.worker.baseSha!), ['early.txt']);
+  assert.deepEqual(await changedFiles(wt, r.worker.baseSha!, r.worker.branch!), ['early.txt']);
 });
 
 test('escalate climbs light → standard → heavy, then fails the brief', async () => {
@@ -101,4 +101,12 @@ test('nudge queues a correction for the active worker', async () => {
   const { amm, b } = await started();
   amm.nudge(b.id, 'use the existing helper');
   assert.equal(amm.workerForBrief(b.id)!.pendingCorrection, 'amm (from your manager): use the existing helper');
+});
+
+test('a concurrent cancel is not overwritten when bind refuses', async () => {
+  const { amm, b, repo } = await started();
+  const p = amm.bind(b.id, 'agent-1', repo);
+  amm.cancel(b.id);
+  assert.ok('error' in (await p));
+  assert.equal(amm.store.all('workers')[0].state, 'cancelled');
 });

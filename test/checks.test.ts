@@ -24,7 +24,7 @@ test('changedFiles lists modified, committed and untracked files since base', as
   fs.writeFileSync(path.join(dir, 'a.txt'), 'changed\n');
   fs.mkdirSync(path.join(dir, 'src'));
   fs.writeFileSync(path.join(dir, 'src', 'new.ts'), 'x\n');
-  assert.deepEqual((await changedFiles(dir, base)).sort(), ['a.txt', 'src/new.ts']);
+  assert.deepEqual((await changedFiles(dir, base, 'main')).sort(), ['a.txt', 'src/new.ts']);
 });
 
 test('runCheck reports exit code and output tail', async () => {
@@ -61,22 +61,22 @@ test('changedFiles sees committed changes, deletions and renames (both paths)', 
   fs.writeFileSync(path.join(dir, 'a.txt'), 'changed\n');
   gitIn(dir, 'commit', '-qam', 'edit');
   gitIn(dir, 'mv', 'old.txt', 'new.txt');
-  assert.deepEqual((await changedFiles(dir, base)).sort(), ['a.txt', 'new.txt', 'old.txt']);
+  assert.deepEqual((await changedFiles(dir, base, 'main')).sort(), ['a.txt', 'new.txt', 'old.txt']);
   fs.rmSync(path.join(dir, 'a.txt'));
-  assert.ok((await changedFiles(dir, base)).includes('a.txt'));
+  assert.ok((await changedFiles(dir, base, 'main')).includes('a.txt'));
 });
 
-test('changedFiles returns raw unicode names and root-relative paths from a subdirectory', async () => {
+test('changedFiles returns raw unicode names with root-relative paths', async () => {
   const dir = repo();
   const base = (await git(dir, ['rev-parse', 'HEAD'])).stdout.trim();
   fs.mkdirSync(path.join(dir, 'sub'));
   fs.writeFileSync(path.join(dir, 'sub', 'ünï\tq".txt'), 'x\n');
-  assert.deepEqual(await changedFiles(path.join(dir, 'sub'), base), ['sub/ünï\tq".txt']);
+  assert.deepEqual(await changedFiles(dir, base, 'main'), ['sub/ünï\tq".txt']);
 });
 
 test('changedFiles throws on a bad base sha', async () => {
   const dir = repo();
-  await assert.rejects(changedFiles(dir, 'deadbeef'), /deadbeef|unknown|bad/i);
+  await assert.rejects(changedFiles(dir, 'deadbeef', 'main'), /deadbeef|unknown|bad/i);
 });
 
 const hasSetsid = (() => {
@@ -114,7 +114,7 @@ test('changedFiles still lists a committed out-of-scope change after a working-t
   fs.writeFileSync(path.join(dir, 'a.txt'), 'evil\n');
   gitIn(dir, 'commit', '-qam', 'evil');
   gitIn(dir, 'revert', '--no-commit', 'HEAD');
-  assert.deepEqual(await changedFiles(dir, base), ['a.txt']);
+  assert.deepEqual(await changedFiles(dir, base, 'main'), ['a.txt']);
 });
 
 test('worktreeInfo describes a worktree', async () => {

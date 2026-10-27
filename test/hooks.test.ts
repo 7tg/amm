@@ -171,3 +171,37 @@ test('files touched by the done checks count toward the scope check', async () =
   amm.report(b.id, { status: 'done', files: [], notes: '' });
   assert.match(String((await hook('SubagentStop', {})).reason), /outside your scope: README.md/);
 });
+
+for (const sabotage of ['rm .git', 'git checkout -q --detach HEAD~0']) {
+  test(`a check that runs "${sabotage}" cannot hide a committed out-of-scope change`, async () => {
+    const { amm, b, hook, repo } = await boundWorker([sabotage]);
+    fs.writeFileSync(path.join(repo, 'README.md'), 'evil\n');
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qam', 'evil'], { cwd: repo });
+    amm.report(b.id, { status: 'done', files: [], notes: '' });
+    const out = await hook('SubagentStop', {});
+    assert.equal(out.decision, 'block');
+    assert.notEqual(amm.brief(b.id).state, 'done');
+  });
+}
+
+test('a committed out-of-scope change is listed even when the checks leave the worktree intact', async () => {
+  const { amm, b, hook, repo } = await boundWorker(['true']);
+  fs.writeFileSync(path.join(repo, 'README.md'), 'evil\n');
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qam', 'evil'], { cwd: repo });
+  amm.report(b.id, { status: 'done', files: [], notes: '' });
+  assert.match(String((await hook('SubagentStop', {})).reason), /outside your scope: README.md/);
+});
+
+test('while validation is in progress a bound worker may only call amm_brief_get', async () => {
+  const { amm, hook } = await boundWorker();
+  const w = amm.workerByAgent('ag1')!;
+  amm.store.put('workers', { ...w, baseSha: null });
+  assert.match(denyReason(await hook('PreToolUse', { tool_name: 'Read', tool_input: {} }))!, /setting up your brief, retry/);
+  assert.equal(denyReason(await hook('PreToolUse', { tool_name: 'mcp__plugin_amm_amm__amm_brief_get', tool_input: { token: w.briefId } })), null);
+});
+
+test('only the exact amm_brief_get tool name is allowed before binding', async () => {
+  const { amm, repo } = await boundWorker();
+  const out = await handleHook(amm, 'PreToolUse', { session_id: 's', cwd: repo, hook_event_name: 'PreToolUse', agent_id: 'ag9', agent_type: 'amm:amm-worker-light', tool_name: 'evil__amm_brief_get', tool_input: { token: 'x' } });
+  assert.match(denyReason(out)!, /fetch your brief first/);
+});
