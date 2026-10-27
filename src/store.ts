@@ -14,6 +14,7 @@ export interface EventFilter {
   runId?: string;
   workerId?: string;
   afterId?: number;
+  kinds?: string[];
   limit?: number;
 }
 
@@ -75,11 +76,13 @@ export class Store {
   }
 
   events(f: EventFilter = {}): AmmEvent[] {
+    const kinds = f.kinds ?? [];
+    const kindSql = f.kinds ? ` AND kind IN (${kinds.map(() => '?').join(',') || 'NULL'})` : '';
     const rows = this.db
       .prepare(
-        'SELECT * FROM events WHERE id > ? AND (? IS NULL OR run_id = ?) AND (? IS NULL OR worker_id = ?) ORDER BY id LIMIT ?',
+        `SELECT * FROM events WHERE id > ? AND (? IS NULL OR run_id = ?) AND (? IS NULL OR worker_id = ?)${kindSql} ORDER BY id LIMIT ?`,
       )
-      .all(f.afterId ?? 0, f.runId ?? null, f.runId ?? null, f.workerId ?? null, f.workerId ?? null, Math.min(10000, Math.max(1, f.limit ?? 1000)));
+      .all(f.afterId ?? 0, f.runId ?? null, f.runId ?? null, f.workerId ?? null, f.workerId ?? null, ...kinds, Math.min(10000, Math.max(1, f.limit ?? 1000)));
     return rows.map((r) => ({
       id: Number(r.id),
       ts: Number(r.ts),
@@ -88,6 +91,11 @@ export class Store {
       kind: String(r.kind),
       detail: JSON.parse(String(r.detail)) as Record<string, unknown>,
     }));
+  }
+
+  lastEventId(runId: string): number {
+    const r = this.db.prepare('SELECT MAX(id) AS m FROM events WHERE run_id = ?').get(runId);
+    return Number(r?.m ?? 0);
   }
 
   close(): void {

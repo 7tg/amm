@@ -38,10 +38,12 @@ test('escalate climbs light → standard → heavy, then fails the brief', async
 
 test('complete, block and cancel end the worker and free its slot', async () => {
   const { amm, run, b } = await started();
-  amm.complete(amm.workerForBrief(b.id)!);
+  await amm.bind(b.id, 'agent-1', initRepo());
+  assert.equal(amm.complete(amm.workerForBrief(b.id)!), true);
   assert.equal(amm.brief(b.id).state, 'done');
   const b2 = amm.addBrief(run.id, { title: 'u', goal: 'g', scope: ['lib/**'], checks: [], tier: 'light' });
   amm.dispatch(run.id);
+  await amm.bind(b2.id, 'agent-2', initRepo());
   amm.report(b2.id, { status: 'blocked', files: [], notes: 'needs api change' });
   amm.markBlocked(amm.workerForBrief(b2.id)!);
   assert.equal(amm.brief(b2.id).state, 'blocked');

@@ -23,7 +23,7 @@ test('dispatch returns agent calls with tiered subagent types and tiny prompts',
   const calls = amm.dispatch(run.id);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].subagent_type, 'amm:amm-worker-light');
-  assert.match(calls[0].prompt, new RegExp(`token "${b.id}"`));
+  assert.match(calls[0].prompt, new RegExp(`token is "${b.id}"`));
   assert.ok(calls[0].prompt.length < 220);
   assert.equal(amm.brief(b.id).state, 'running');
   assert.equal(amm.workerForBrief(b.id)!.state, 'starting');

@@ -41,9 +41,12 @@ export class Amm {
     this.limits = limits;
     this.now = now;
     this.sem = new Semaphores(now);
-    // Rebuild worker slots after a restart; leases restart from now.
+    // Rebuild worker slots after a restart; leases keep their remaining time.
     for (const w of store.all('workers')) {
-      if (ACTIVE.includes(w.state)) this.sem.tryAcquire('workers', w.id, Infinity, limits.leaseMs);
+      if (!ACTIVE.includes(w.state)) continue;
+      const extra = w.state === 'checking' ? (this.store.get('briefs', w.briefId)?.checks.length ?? 0) * limits.checkTimeoutMs : 0;
+      const remaining = Math.max(1, w.lastEventAt + limits.leaseMs + extra - now());
+      this.sem.tryAcquire('workers', w.id, Infinity, remaining);
     }
   }
 
@@ -64,10 +67,11 @@ export class Amm {
   }
 
   async startRun(input: { repo: string; testCmd: string; baseBranch?: string }): Promise<Run> {
-    const baseBranch = input.baseBranch ?? (await git(input.repo, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim();
+    const repo = fs.existsSync(input.repo) ? fs.realpathSync(input.repo) : input.repo;
+    const baseBranch = input.baseBranch ?? (await git(repo, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim();
     const run: Run = {
       id: newId('r'),
-      repo: input.repo,
+      repo,
       baseBranch,
       testCmd: input.testCmd,
       sessionId: null,
@@ -80,8 +84,14 @@ export class Amm {
     return run;
   }
 
+  private activeRun(runId: string): Run {
+    const r = this.run(runId);
+    if (r.state !== 'active') throw new Error(`run ${runId} is ${r.state}`);
+    return r;
+  }
+
   addBrief(runId: string, input: BriefInput, state: Brief['state'] = 'queued'): Brief {
-    this.run(runId);
+    this.activeRun(runId);
     const b: Brief = {
       id: newId('b'),
       runId,
@@ -103,6 +113,7 @@ export class Amm {
   }
 
   importPlan(runId: string, file: string): Brief[] {
+    this.activeRun(runId);
     const tasks = parsePlan(fs.readFileSync(file, 'utf8'));
     if (tasks.length === 0) throw new Error(`no "### Task N:" headings found in ${file}`);
     return tasks.map((t) =>
@@ -115,17 +126,21 @@ export class Amm {
     if (!['draft', 'queued', 'blocked', 'failed'].includes(b.state)) {
       throw new Error(`brief ${briefId} is ${b.state}; only draft, queued, blocked or failed briefs can change`);
     }
-    const { ready, ...fields } = patch;
+    const fields: BriefPatch = {};
+    for (const k of ['title', 'goal', 'scope', 'checks', 'tier', 'maxTurns'] as const) {
+      if (patch[k] !== undefined) (fields as Record<string, unknown>)[k] = patch[k];
+    }
+    const ready = patch.ready;
     const next: Brief = { ...b, ...fields };
     if (fields.tier && fields.maxTurns === undefined) next.maxTurns = TIER_MAX_TURNS[fields.tier];
     if (ready) {
-      if (next.scope.length === 0) throw new Error(`brief ${briefId} needs a scope before it is ready`);
       if (b.state === 'blocked' || b.state === 'failed') {
         next.attempt = b.attempt + 1;
         next.report = null;
       }
       next.state = 'queued';
     }
+    if (next.state === 'queued' && next.scope.length === 0) throw new Error(`brief ${briefId} needs a scope before it is queued`);
     this.store.put('briefs', next);
     return next;
   }
@@ -146,29 +161,42 @@ export class Amm {
     return this.store.all('workers').find((w) => w.agentId === agentId);
   }
 
-  dispatch(runId: string): AgentCall[] {
+  /** Queued briefs of a run that could start now, in order, given free slots and scope overlap. */
+  private dispatchable(runId: string): Brief[] {
     const repo = this.run(runId).repo;
     const held = this.activeWorkers()
       .map((w) => this.brief(w.briefId))
       .filter((b) => this.run(b.runId).repo === repo);
+    let free = this.limits.maxWorkers - this.sem.holders('workers').length;
+    const out: Brief[] = [];
     const queued = this.store
       .all('briefs')
       .filter((b) => b.runId === runId && b.state === 'queued')
       .sort((a, b) => a.seq - b.seq);
-    const calls: AgentCall[] = [];
     for (const b of queued) {
+      if (free <= 0) break;
       if (held.some((h) => scopesOverlap(h.scope, b.scope))) continue;
+      out.push(b);
+      held.push(b);
+      free--;
+    }
+    return out;
+  }
+
+  dispatch(runId: string): AgentCall[] {
+    this.activeRun(runId);
+    const calls: AgentCall[] = [];
+    for (const b of this.dispatchable(runId)) {
       const w = this.newWorker(b);
       if (!this.sem.tryAcquire('workers', w.id, this.limits.maxWorkers, this.limits.leaseMs)) break;
       this.store.put('workers', w);
       this.store.put('briefs', { ...b, state: 'running' });
-      held.push(b);
       this.event('dispatch', runId, w.id, { briefId: b.id, tier: b.tier, attempt: b.attempt });
       calls.push({
         briefId: b.id,
         subagent_type: agentType(b.tier),
         description: `amm ${b.id}: ${b.title}`.slice(0, 60),
-        prompt: `amm worker. Load the tool with ToolSearch query "select:${toolName('amm_brief_get')}", then call it with token "${b.id}" and follow the brief.`,
+        prompt: `amm worker. Your brief token is "${b.id}".`,
       });
     }
     return calls;
@@ -238,10 +266,13 @@ export class Amm {
           out.push(`  ${b.id} [${b.state}] ${b.tier} a${b.attempt} ${b.title}${w ? ` · ${w.toolCalls} calls` : ''}`);
         }
       }
-      const fresh = this.store.events({ runId: r.id, afterId: r.statusCursor });
-      for (const e of fresh) if (NOTABLE.has(e.kind)) out.push(`  ${describe(e)}`);
-      if (fresh.length) this.store.put('runs', { ...this.run(r.id), statusCursor: fresh.at(-1)!.id });
-      if (count('queued') > 0 && this.sem.holders('workers').length < this.limits.maxWorkers) {
+      const fresh = this.store.events({ runId: r.id, afterId: r.statusCursor, kinds: [...NOTABLE], limit: 10000 });
+      for (const e of fresh) out.push(`  ${describe(e)}`);
+      if (runId) {
+        const last = this.store.lastEventId(r.id);
+        if (last > r.statusCursor) this.store.put('runs', { ...this.run(r.id), statusCursor: last });
+      }
+      if (r.state === 'active' && this.dispatchable(r.id).length > 0) {
         out.push('  → queued briefs and free slots: call amm_dispatch');
       }
       if (briefs.length > 0 && briefs.every((b) => b.state === 'done' || b.state === 'cancelled')) {
@@ -261,20 +292,35 @@ export class Amm {
     return next;
   }
 
+  /** Writes the patch only if the worker is still in one of the `from` states. */
+  private transition(w: Worker, from: WorkerState[], patch: Partial<Worker>): Worker | null {
+    const cur = this.fresh(w);
+    if (!from.includes(cur.state)) return null;
+    const next = { ...cur, ...patch };
+    this.store.put('workers', next);
+    return next;
+  }
+
   async bind(briefId: string, agentId: string, worktree: string): Promise<Worker | undefined> {
     const existing = this.workerByAgent(agentId);
     if (existing) return existing;
     const w = this.workerForBrief(briefId);
     if (!w || w.agentId) return undefined;
-    const sha = (await git(worktree, ['rev-parse', 'HEAD'])).stdout.trim() || null;
-    const bound = this.putWorker(w, { agentId, worktree, baseSha: sha, state: 'running', lastEventAt: this.now() });
-    this.sem.renew(w.id, this.limits.leaseMs);
+    const claimed = this.transition(w, ['starting'], { agentId, worktree, state: 'running', lastEventAt: this.now() });
+    if (!claimed) return undefined;
+    this.sem.tryAcquire('workers', w.id, Infinity, this.limits.leaseMs);
     this.event('bind', w.runId, w.id, { briefId, agentId, worktree });
-    return bound;
+    let sha: string | null = null;
+    try {
+      sha = (await git(worktree, ['rev-parse', 'HEAD'])).stdout.trim() || null;
+    } catch {
+      sha = null;
+    }
+    return this.putWorker(w, { baseSha: sha });
   }
 
   touchWorker(w: Worker): Worker {
-    this.sem.renew(w.id, this.limits.leaseMs);
+    if (ACTIVE.includes(this.fresh(w).state)) this.sem.tryAcquire('workers', w.id, Infinity, this.limits.leaseMs);
     return this.putWorker(w, { lastEventAt: this.now() });
   }
 
@@ -296,14 +342,18 @@ export class Amm {
     return msg;
   }
 
-  markChecking(w: Worker, transcriptPath: string | null): Worker {
+  markChecking(w: Worker, transcriptPath: string | null): Worker | null {
+    const next = this.transition(w, ['running'], { state: 'checking', transcriptPath: transcriptPath ?? this.fresh(w).transcriptPath });
+    if (!next) return null;
     const checks = this.brief(w.briefId).checks.length;
-    this.sem.renew(w.id, this.limits.leaseMs + checks * this.limits.checkTimeoutMs);
-    return this.putWorker(w, { state: 'checking', transcriptPath: transcriptPath ?? this.fresh(w).transcriptPath });
+    this.sem.tryAcquire('workers', w.id, Infinity, this.limits.leaseMs + checks * this.limits.checkTimeoutMs);
+    return next;
   }
 
-  stopBlocked(w: Worker, problems: string[]): Worker {
-    const next = this.putWorker(w, { state: 'running', stopBlocks: this.fresh(w).stopBlocks + 1 });
+  stopBlocked(w: Worker, problems: string[]): Worker | null {
+    const next = this.transition(w, ['checking'], { state: 'running', stopBlocks: this.fresh(w).stopBlocks + 1 });
+    if (!next) return null;
+    this.sem.tryAcquire('workers', w.id, Infinity, this.limits.leaseMs);
     this.event('gate_fail', w.runId, w.id, { briefId: w.briefId, problems });
     return next;
   }
@@ -314,27 +364,31 @@ export class Amm {
     this.event('report', b.runId, this.workerForBrief(b.id)?.id ?? null, { briefId, status: r.status, files: r.files, notes: r.notes });
   }
 
-  private endWorker(w: Worker, state: WorkerState): Worker {
+  private endWorker(w: Worker, from: WorkerState[], state: WorkerState): boolean {
+    if (!this.transition(w, from, { state })) return false;
     this.sem.release(w.id);
-    return this.putWorker(w, { state });
+    return true;
   }
 
-  complete(w: Worker): void {
-    this.endWorker(w, 'done');
+  complete(w: Worker): boolean {
     const b = this.brief(w.briefId);
+    if (b.state !== 'running') return false;
+    if (!this.endWorker(w, ['checking', 'running'], 'done')) return false;
     this.store.put('briefs', { ...b, state: 'done' });
     this.event('done', b.runId, w.id, { briefId: b.id, title: b.title });
+    return true;
   }
 
-  markBlocked(w: Worker): void {
-    this.endWorker(w, 'blocked');
+  markBlocked(w: Worker): boolean {
+    if (!this.endWorker(w, ['running', 'checking'], 'blocked')) return false;
     const b = this.brief(w.briefId);
     this.store.put('briefs', { ...b, state: 'blocked' });
     this.event('blocked', b.runId, w.id, { briefId: b.id, notes: b.report?.notes ?? '' });
+    return true;
   }
 
-  escalate(w: Worker, reason: string): void {
-    this.endWorker(w, 'escalated');
+  escalate(w: Worker, reason: string): boolean {
+    if (!this.endWorker(w, ACTIVE, 'escalated')) return false;
     const b = this.brief(w.briefId);
     const tier = nextTier(b.tier);
     const notes = [...b.notes, `attempt ${b.attempt} (${b.tier}) was stopped: ${reason}`];
@@ -345,6 +399,7 @@ export class Amm {
       this.store.put('briefs', { ...b, notes, state: 'failed' });
       this.event('failed', b.runId, w.id, { briefId: b.id, reason });
     }
+    return true;
   }
 
   nudge(briefId: string, message: string): void {
@@ -362,7 +417,7 @@ export class Amm {
     for (const b of briefs) {
       if (b.state === 'done' || b.state === 'cancelled') continue;
       const w = this.workerForBrief(b.id);
-      if (w) this.endWorker(w, 'cancelled');
+      if (w) this.endWorker(w, ACTIVE, 'cancelled');
       this.store.put('briefs', { ...this.brief(b.id), state: 'cancelled' });
       this.event('cancel', b.runId, w?.id ?? null, { briefId: b.id });
     }
