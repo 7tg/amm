@@ -266,9 +266,9 @@ export class Amm {
           out.push(`  ${b.id} [${b.state}] ${b.tier} a${b.attempt} ${b.title}${w ? ` · ${w.toolCalls} calls` : ''}`);
         }
       }
-      const fresh = this.store.events({ runId: r.id, afterId: r.statusCursor, kinds: [...NOTABLE], limit: 10000 });
-      for (const e of fresh) out.push(`  ${describe(e)}`);
       if (runId) {
+        const fresh = this.store.events({ runId: r.id, afterId: r.statusCursor, kinds: [...NOTABLE], limit: 10000 });
+        for (const e of fresh) out.push(`  ${describe(e)}`);
         const last = this.store.lastEventId(r.id);
         if (last > r.statusCursor) this.store.put('runs', { ...this.run(r.id), statusCursor: last });
       }

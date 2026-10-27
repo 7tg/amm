@@ -54,8 +54,7 @@ async function setup() {
 test('status() without a run id does not advance cursors', async () => {
   const { amm, run } = await setup();
   amm.event('done', run.id, null, { briefId: 'bx', title: 'zz' });
-  assert.match(amm.status(), /bx done: zz/);
-  assert.match(amm.status(), /bx done: zz/);
+  assert.doesNotMatch(amm.status(), /bx done/);
   assert.match(amm.status(run.id), /bx done: zz/);
   assert.doesNotMatch(amm.status(run.id), /bx done/);
 });
@@ -131,4 +130,15 @@ test('dispatch prompt is minimal', async () => {
   const b2 = r.amm.addBrief(r.run.id, { title: 'a', goal: 'g', scope: ['a'], checks: [], tier: 'light' });
   assert.equal(r.amm.dispatch(r.run.id)[0].prompt, `amm worker. Your brief token is "${b2.id}".`);
   void b;
+});
+
+test('status without a run id lists summaries only and keeps the cursor', async () => {
+  const { amm, run } = await setup();
+  const b = amm.addBrief(run.id, { title: 'a', goal: 'g', scope: ['src/**'], checks: [], tier: 'light' });
+  amm.dispatch(run.id);
+  amm.cancel(b.id);
+  const all = amm.status();
+  assert.match(all, /^run /);
+  assert.doesNotMatch(all, /cancel/);
+  assert.match(amm.status(run.id), /cancel/);
 });
