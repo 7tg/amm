@@ -29,6 +29,19 @@ or waits, and while the binary is missing it fails open, so it never blocks the 
 Ask the main session to delegate a goal or a plan file ("delegate this plan with amm"), or invoke
 `/amm:delegate`.
 
+## Dashboard
+
+The daemon also serves a read-only dashboard: runs, briefs as a board, each worker's events,
+and token and cost totals for workers and manager sessions. Run
+
+```bash
+amm dashboard
+```
+
+to print `http://127.0.0.1:<port>/?token=<token>` and open it in a browser. The link logs the
+browser in with an `HttpOnly` cookie and redirects to `/`; the page then updates live over
+Server-Sent Events. With no daemon running, `amm dashboard` prints a hint and exits 1.
+
 ## Develop
 
 ```bash

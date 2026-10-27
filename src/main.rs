@@ -17,6 +17,8 @@ enum Command {
     Shim,
     /// Handle a Claude Code hook event (stdin: the hook payload)
     Hook { event: Option<String> },
+    /// Print the running daemon's dashboard URL
+    Dashboard,
 }
 
 fn main() {
@@ -30,6 +32,21 @@ fn main() {
         Command::Daemon => std::process::exit(daemon()),
         Command::Shim => std::process::exit(shim()),
         Command::Hook { event } => std::process::exit(amm::hook_client::run_hook(event.as_deref())),
+        Command::Dashboard => std::process::exit(dashboard()),
+    }
+}
+
+fn dashboard() -> i32 {
+    let env: Env = std::env::vars().collect();
+    match amm::daemon::read_lock(&amm_home(&env)).filter(amm::daemon::is_healthy) {
+        Some(l) => {
+            println!("http://127.0.0.1:{}/?token={}", l.port, l.token);
+            0
+        }
+        None => {
+            eprintln!("amm: no daemon running (it starts with a Claude Code session that uses amm)");
+            1
+        }
     }
 }
 

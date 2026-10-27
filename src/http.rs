@@ -63,16 +63,45 @@ fn too_large() -> Response {
     r
 }
 
-/// Constant-time token compare. A missing or repeated header never matches.
-fn token_ok(req: &Request, token: &[u8]) -> bool {
-    let mut values = req.headers().get_all("x-amm-token").iter();
-    let (Some(given), None) = (values.next(), values.next()) else { return false };
-    let given = given.as_bytes();
+/// Constant-time compare (the length is not secret).
+fn same(given: &[u8], token: &[u8]) -> bool {
     if given.len() != token.len() {
         return false;
     }
     let diff = given.iter().zip(token).fold(0u8, |acc, (a, b)| acc | (a ^ b));
     std::hint::black_box(diff) == 0
+}
+
+/// Constant-time token compare. A missing or repeated header never matches.
+fn token_ok(req: &Request, token: &[u8]) -> bool {
+    let mut values = req.headers().get_all("x-amm-token").iter();
+    let (Some(given), None) = (values.next(), values.next()) else { return false };
+    same(given.as_bytes(), token)
+}
+
+/// Whether the `amm_token` cookie carries the token. Several `amm_token` cookies never match.
+fn cookie_ok(req: &Request, token: &[u8]) -> bool {
+    let mut found = req
+        .headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .flat_map(|v| v.as_bytes().split(|&b| b == b';'))
+        .filter_map(|c| c.trim_ascii().strip_prefix(b"amm_token="));
+    let (Some(given), None) = (found.next(), found.next()) else { return false };
+    same(given, token)
+}
+
+/// Dashboard paths also accept the cookie; `/api`, `/hook` and `/health` stay header-only.
+fn dashboard_path(path: &str) -> bool {
+    path == "/" || path.starts_with("/assets/") || path.starts_with("/dash/")
+}
+
+/// `GET /?token=<t>`: the token from the query, if one is given.
+fn login_token(req: &Request) -> Option<String> {
+    if req.uri().path() != "/" || req.method() != Method::GET {
+        return None;
+    }
+    req.uri().query()?.split('&').find_map(|kv| kv.strip_prefix("token=")).map(str::to_string)
 }
 
 async fn guard(State(s): State<AppState>, req: Request, next: Next) -> Response {
@@ -81,7 +110,21 @@ async fn guard(State(s): State<AppState>, req: Request, next: Next) -> Response 
     if !host.is_some_and(|h| local.iter().any(|l| l == h)) {
         return error(StatusCode::FORBIDDEN, "bad host");
     }
-    if !token_ok(&req, s.token.as_bytes()) {
+    if let Some(given) = login_token(&req) {
+        if !same(given.as_bytes(), s.token.as_bytes()) {
+            return error(StatusCode::UNAUTHORIZED, "bad token");
+        }
+        (s.on_activity)();
+        let cookie = format!("amm_token={}; HttpOnly; SameSite=Strict; Path=/", s.token);
+        let mut r = StatusCode::SEE_OTHER.into_response();
+        r.headers_mut().insert(header::LOCATION, HeaderValue::from_static("/"));
+        if let Ok(v) = HeaderValue::from_str(&cookie) {
+            r.headers_mut().insert(header::SET_COOKIE, v);
+        }
+        return r;
+    }
+    let cookie = dashboard_path(req.uri().path()) && cookie_ok(&req, s.token.as_bytes());
+    if !cookie && !token_ok(&req, s.token.as_bytes()) {
         return error(StatusCode::UNAUTHORIZED, "bad token");
     }
     (s.on_activity)();
