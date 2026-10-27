@@ -177,7 +177,9 @@ impl Store {
                 run_id: r.get(2)?,
                 worker_id: r.get(3)?,
                 kind: r.get(4)?,
-                detail: serde_json::from_str(&detail).unwrap_or_default(),
+                detail: serde_json::from_str(&detail).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+                })?,
             })
         })?;
         rows.collect()
@@ -396,6 +398,19 @@ mod tests {
         let s = Store::open(&file).unwrap();
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        for ext in ["-wal", "-shm"] {
+            let mut p = file.as_os_str().to_owned();
+            p.push(ext);
+            let m = std::fs::metadata(Path::new(&p)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(m, 0o600, "{ext}");
+        }
+        let mut s = s;
+        s.put(&sess("s1", "/a", 1)).unwrap();
+        let data: String = s.db.query_row("SELECT data FROM sessions WHERE id = 's1'", [], |r| r.get(0)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&data).unwrap();
+        let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["cwd", "firstSeen", "id", "lastSeen"]);
         let jm: String =
             s.db.query_row("PRAGMA journal_mode", [], |r| r.get(0))
                 .unwrap();
@@ -413,6 +428,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn corrupt_event_detail_is_an_error_not_an_empty_object() {
+        let s = Store::open(&db_file()).unwrap();
+        s.db.execute(
+            "INSERT INTO events (ts, run_id, worker_id, kind, detail) VALUES (1, 'r', NULL, 'k', '{not json')",
+            [],
+        )
+        .unwrap();
+        assert!(s.events(&EventFilter::default()).is_err());
     }
 
     #[test]
