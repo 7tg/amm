@@ -1,6 +1,22 @@
 <!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
-<title>amm</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>amm dashboard</title>
 <link rel="stylesheet" href="/assets/style.css">
-<main id="app">amm dashboard (placeholder)</main>
+</head>
+<body>
+<header id="header">
+  <h1>amm</h1>
+  <div id="totals" class="totals"></div>
+  <div id="live" class="live off"><span class="dot"></span><span id="live-text">disconnected</span></div>
+</header>
+<main id="app">
+  <section id="sessions"></section>
+  <section id="runs"><p class="muted">Loading...</p></section>
+</main>
+<aside id="panel" class="panel" hidden></aside>
 <script src="/assets/app.js"></script>
+</body>
+</html>
