@@ -24,58 +24,8 @@ jobs:
           fi
 
   build:
-    name: build ${{ matrix.target }}
     needs: verify
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            zig: true
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            zig: true
-          - target: x86_64-apple-darwin
-            os: macos-13
-            zig: false
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            zig: false
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      - name: Install zig
-        if: matrix.zig
-        # PyPI's ziglang wheel; cargo-zigbuild finds it via `python3 -m ziglang`.
-        run: pip install ziglang
-      - name: Install cargo-zigbuild
-        if: matrix.zig
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
-      - name: Build (zigbuild)
-        if: matrix.zig
-        run: cargo zigbuild --release --target ${{ matrix.target }}
-      - name: Build (native)
-        if: ${{ !matrix.zig }}
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Package
-        run: |
-          mkdir -p dist-out
-          cp target/${{ matrix.target }}/release/amm dist-out/amm
-          tar -C dist-out -czf amm-${{ matrix.target }}.tar.gz amm
-      - uses: actions/upload-artifact@v4
-        with:
-          name: amm-${{ matrix.target }}
-          path: amm-${{ matrix.target }}.tar.gz
-          if-no-files-found: error
+    uses: ./.github/workflows/build.yml
 
   publish:
     needs: build

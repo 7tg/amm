@@ -1,0 +1,78 @@
+name: Build
+
+# Reusable: builds amm for every release target and uploads amm-<target>.tar.gz
+# artifacts. Called by CI (every push / PR) and Release (tags).
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+            native: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+            native: false
+          # Both macOS targets build on Apple Silicon runners; Intel is a
+          # cross-compile (the macos-13 Intel image is no longer scheduled).
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            zig: false
+            native: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            zig: false
+            native: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install zig
+        if: matrix.zig
+        # PyPI's ziglang wheel; cargo-zigbuild finds it via `python3 -m ziglang`.
+        run: pip install ziglang
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build (zigbuild)
+        if: matrix.zig
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+      - name: Build (native toolchain)
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Smoke test
+        if: matrix.native
+        run: |
+          out="$(target/${{ matrix.target }}/release/amm --version)"
+          echo "$out"
+          case "$out" in "amm "*) ;; *) echo "::error::unexpected --version output"; exit 1 ;; esac
+      - name: Check binary architecture
+        run: file target/${{ matrix.target }}/release/amm
+      - name: Package
+        run: |
+          mkdir -p dist-out
+          cp target/${{ matrix.target }}/release/amm dist-out/amm
+          tar -C dist-out -czf amm-${{ matrix.target }}.tar.gz amm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amm-${{ matrix.target }}
+          path: amm-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
