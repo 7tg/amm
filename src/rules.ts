@@ -63,7 +63,7 @@ export function evaluate(c: Counters, e: ToolEvent, ctx: RuleContext): { counter
   next.sinceProgress = progressed ? 0 : c.sinceProgress + 1;
   if (progressed) forget(next, 'no-progress');
   if (cmd !== null) {
-    if (cmd !== c.lastCmd || !e.failed) forget(next, 'repeat-failure');
+    if (cmd === c.lastCmd ? !e.failed : e.failed) forget(next, 'repeat-failure');
     if (e.failed) {
       next.lastCmdFails = cmd === c.lastCmd ? c.lastCmdFails + 1 : 1;
       next.lastCmd = cmd;

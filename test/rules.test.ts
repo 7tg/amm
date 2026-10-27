@@ -78,8 +78,14 @@ test('a failed edit does not count as progress', () => {
   assert.equal((r.verdicts.at(-1) as { rule: string }).rule, 'no-progress');
 });
 
-test('repeat-failure forgets it fired after a different command runs', () => {
+test('an unrelated successful command does not reset repeat-failure', () => {
   const first = feed([bash('make', true), bash('make', true), bash('make', true), bash('ls')]);
+  const again = feed([bash('make', true), bash('make', true), bash('make', true)], first.counters);
+  assert.deepEqual(again.verdicts.at(-1), { kind: 'escalate', rule: 'repeat-failure' });
+});
+
+test('repeat-failure is forgotten when a different command fails', () => {
+  const first = feed([bash('make', true), bash('make', true), bash('make', true), bash('lint', true)]);
   const again = feed([bash('make', true), bash('make', true), bash('make', true)], first.counters);
   assert.equal(again.verdicts.at(-1)!.kind, 'correct');
 });
