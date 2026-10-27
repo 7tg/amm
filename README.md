@@ -10,6 +10,10 @@ agents (Haiku / Sonnet / Opus) do the work in isolated git worktrees; amm superv
 
 One daemon per machine (`~/.amm`, `127.0.0.1:7878`) holds all state in SQLite.
 
+[![Meet amm: the main Claude Code session writes briefs, cheaper Haiku, Sonnet and Opus workers do the work in isolated git worktrees, amm blocks out-of-scope edits, pushes and agent spawns, corrects or escalates stuck workers, refuses done until the checks pass, merges and tests every brief on an integration branch, shows it all on a live dashboard, and how to install it](https://raw.githubusercontent.com/7tg/amm/master/docs/media/demo.gif)](https://github.com/7tg/amm/blob/master/docs/media/demo.mp4)
+
+<sub>Briefs, workers in worktrees, guardrails, the watchdog, the done gate, integration, the dashboard, then installing it. 54 seconds · 1080p · 60 fps · original soundtrack. [Watch the film](https://github.com/7tg/amm/blob/master/docs/media/demo.mp4).</sub>
+
 ## Install
 
 In Claude Code:
