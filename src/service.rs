@@ -10,7 +10,8 @@ use crate::store::{EventFilter, Store, StoreError};
 use crate::types::{AmmEvent, Brief, BriefState, Clock, Report, Run, RunState, Session, Tier, Worker, WorkerState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::path::Path;
+use std::cmp::Ordering;
+use std::path::{Path, PathBuf};
 
 pub const ACTIVE: [WorkerState; 3] = [WorkerState::Starting, WorkerState::Running, WorkerState::Checking];
 const NOTABLE: [&str; 6] = ["done", "escalate", "failed", "blocked", "lost", "cancel"];
@@ -137,6 +138,11 @@ pub fn validate_worktree(run_repo: &Path, cwd: &Path) -> Result<WorktreeCheck, S
     Ok(WorktreeCheck { toplevel: info.toplevel.to_string_lossy().into_owned(), branch, base_sha: sha.to_string() })
 }
 
+/// The real path of `path` when it exists, else `path` as given. Touches the filesystem; call it without the lock.
+pub fn resolve_repo(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// The branch checked out in `repo`, for runs started without a base branch. Runs git; call it without the lock.
 pub fn resolve_base_branch(repo: &Path) -> Result<String, String> {
     let r = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
@@ -171,7 +177,9 @@ impl Amm {
         let mut sem = Semaphores::new(now.clone());
         // Rebuild worker slots after a restart; leases keep their remaining time.
         let t = now();
-        for w in store.all::<Worker>() {
+        let mut workers = store.all::<Worker>();
+        workers.sort_by(by_start);
+        for w in workers {
             if !is_active(w.state) {
                 continue;
             }
@@ -207,14 +215,10 @@ impl Amm {
         self.store.get::<Brief>(brief_id).ok_or_else(|| AmmError(format!("unknown brief {brief_id}")))
     }
 
-    /// Starts a run. Runs no git: callers resolve a missing base branch with `resolve_base_branch` first.
+    /// Starts a run. No IO: callers pass `repo` through `resolve_repo` and a missing base branch through
+    /// `resolve_base_branch` before taking the lock.
     pub fn start_run(&mut self, input: StartRun) -> AmmResult<Run> {
-        let p = Path::new(&input.repo);
-        let repo = if p.exists() {
-            p.canonicalize().map_err(|e| AmmError(format!("{}: {e}", input.repo)))?.to_string_lossy().into_owned()
-        } else {
-            input.repo.clone()
-        };
+        let repo = input.repo;
         let base_branch = input.base_branch;
         let run = Run {
             id: new_id("r"),
@@ -267,12 +271,12 @@ impl Amm {
         Ok(b)
     }
 
-    pub fn import_plan(&mut self, run_id: &str, file: &Path) -> AmmResult<Vec<Brief>> {
+    /// Imports a plan's markdown (read by the caller, outside the lock); `label` names it in errors.
+    pub fn import_plan(&mut self, run_id: &str, md: &str, label: &str) -> AmmResult<Vec<Brief>> {
         self.active_run(run_id)?;
-        let md = std::fs::read_to_string(file).map_err(|e| AmmError(format!("{}: {e}", file.display())))?;
-        let tasks = parse_plan(&md);
+        let tasks = parse_plan(md);
         if tasks.is_empty() {
-            return err(format!("no \"### Task N:\" headings found in {}", file.display()));
+            return err(format!("no \"### Task N:\" headings found in {label}"));
         }
         tasks
             .into_iter()
@@ -342,11 +346,16 @@ impl Amm {
             .all::<Worker>()
             .into_iter()
             .filter(|w| w.brief_id == brief_id && is_active(w.state))
-            .max_by_key(|w| w.started_at)
+            // Newest start wins; on a tie the earliest id, so the answer never depends on map order.
+            .max_by(|a, b| a.started_at.cmp(&b.started_at).then_with(|| b.id.cmp(&a.id)))
     }
 
+    /// The earliest-started worker bound to `agent_id` (ties: earliest id).
     pub fn worker_by_agent(&self, agent_id: &str) -> Option<Worker> {
-        self.store.all::<Worker>().into_iter().find(|w| w.agent_id.as_deref() == Some(agent_id))
+        let mut ws: Vec<Worker> =
+            self.store.all::<Worker>().into_iter().filter(|w| w.agent_id.as_deref() == Some(agent_id)).collect();
+        ws.sort_by(by_start);
+        ws.into_iter().next()
     }
 
     /// Queued briefs of a run that could start now, in order, given free slots and scope overlap.
@@ -386,8 +395,12 @@ impl Amm {
             if !self.sem.try_acquire("workers", &w.id, self.limits.max_workers, self.limits.lease_ms) {
                 break;
             }
-            self.store.put(&w)?;
-            self.store.put(&Brief { state: BriefState::Running, ..b.clone() })?;
+            // Store errors are fatal-ish (the daemon reports them), but must not leak the slot just acquired.
+            let stored = self.store.put(&w).and_then(|_| self.store.put(&Brief { state: BriefState::Running, ..b.clone() }));
+            if let Err(e) = stored {
+                self.sem.release(&w.id);
+                return Err(e.into());
+            }
             self.event(
                 "dispatch",
                 Some(run_id),
@@ -584,30 +597,39 @@ impl Amm {
         Ok(BindClaim::Claimed(claimed))
     }
 
-    /// Bind phase 3: finalises the claim with the validated worktree, or releases it. The release is guarded, so a
-    /// cancel that landed while the worktree was validated stays cancelled.
-    pub fn finish_bind(&mut self, worker_id: &str, check: Result<WorktreeCheck, String>) -> Result<Worker, String> {
+    /// Bind phase 3: finalises `agent_id`'s claim with the validated worktree, or releases it. Both are guarded:
+    /// only the claimer's own claim, still running, is touched, so a cancel, sweep or later claim that landed while
+    /// the worktree was validated wins.
+    pub fn finish_bind(
+        &mut self,
+        worker_id: &str,
+        agent_id: &str,
+        check: Result<WorktreeCheck, String>,
+    ) -> Result<Worker, String> {
         let w = self.store.get::<Worker>(worker_id).ok_or_else(|| format!("unknown worker {worker_id}"))?;
+        let ours = w.agent_id.as_deref() == Some(agent_id) && w.state == WorkerState::Running;
         let detail = |extra: Value| {
-            let mut d = obj(serde_json::json!({ "briefId": w.brief_id, "agentId": w.agent_id }));
+            let mut d = obj(serde_json::json!({ "briefId": w.brief_id, "agentId": agent_id }));
             d.extend(obj(extra));
             Value::Object(d)
         };
         match check {
             Err(error) => {
-                self.transition(&w, &[WorkerState::Running], |x| {
-                    x.agent_id = None;
-                    x.worktree = None;
-                    x.state = WorkerState::Starting;
-                })
-                .map_err(|e| e.0)?;
+                if ours {
+                    self.transition(&w, &[WorkerState::Running], |x| {
+                        x.agent_id = None;
+                        x.worktree = None;
+                        x.state = WorkerState::Starting;
+                    })
+                    .map_err(|e| e.0)?;
+                }
                 let d = detail(serde_json::json!({ "cwd": w.worktree, "error": error }));
                 self.event("bind_refused", Some(&w.run_id), Some(&w.id), d).map_err(|e| e.0)?;
                 Err(error)
             }
+            Ok(_) if !ours => Err(lost_claim(&w, agent_id)),
             Ok(c) => {
                 let toplevel = c.toplevel.clone();
-                // Guarded too: a cancel or sweep that landed while we validated must get no worktree written.
                 let bound = self
                     .transition(&w, &[WorkerState::Running], |x| {
                         x.worktree = Some(c.toplevel);
@@ -615,7 +637,7 @@ impl Amm {
                         x.base_sha = Some(c.base_sha);
                     })
                     .map_err(|e| e.0)?;
-                let Some(bound) = bound else { return Err("brief was cancelled".into()) };
+                let Some(bound) = bound else { return Err(lost_claim(&w, agent_id)) };
                 let d = detail(serde_json::json!({ "worktree": toplevel }));
                 self.event("bind", Some(&w.run_id), Some(&w.id), d).map_err(|e| e.0)?;
                 Ok(bound)
@@ -623,13 +645,14 @@ impl Amm {
         }
     }
 
-    /// All three bind phases in one call. Runs git while holding `&mut self`; for tests and single-threaded callers.
+    /// All three bind phases in one call. Runs git while holding `&mut self`, so tests only.
+    #[cfg(test)]
     pub fn bind_blocking(&mut self, brief_id: &str, agent_id: &str, cwd: &Path) -> Result<Worker, String> {
         match self.claim_bind(brief_id, agent_id, cwd)? {
             BindClaim::Bound(w) => Ok(w),
             BindClaim::Claimed(w) => {
                 let check = self.run(&w.run_id).map_err(|e| e.0).and_then(|r| validate_worktree(Path::new(&r.repo), cwd));
-                self.finish_bind(&w.id, check)
+                self.finish_bind(&w.id, agent_id, check)
             }
         }
     }
@@ -728,6 +751,7 @@ impl Amm {
         if !self.end_worker(w, &[WorkerState::Checking, WorkerState::Running], WorkerState::Done, |x| x.gated_sha = gated_sha)? {
             return Ok(false);
         }
+        // The worker has ended and its slot is free; a failed brief write is still reported to the caller.
         self.store.put(&Brief { state: BriefState::Done, ..b.clone() })?;
         self.event("done", Some(&b.run_id), Some(&w.id), serde_json::json!({ "briefId": b.id, "title": b.title }))?;
         Ok(true)
@@ -837,6 +861,21 @@ impl Amm {
         };
         self.store.put(&next)?;
         Ok(())
+    }
+}
+
+/// Workers in start order, ties broken by id.
+fn by_start(a: &Worker, b: &Worker) -> Ordering {
+    a.started_at.cmp(&b.started_at).then_with(|| a.id.cmp(&b.id))
+}
+
+/// Why `agent_id` no longer holds the claim on `w`.
+fn lost_claim(w: &Worker, agent_id: &str) -> String {
+    match w.state {
+        WorkerState::Cancelled => "brief was cancelled".into(),
+        WorkerState::Lost => "worker lost".into(),
+        _ if w.agent_id.as_deref() != Some(agent_id) => "worker was claimed by another agent".into(),
+        s => format!("worker is {}", serde_json::to_value(s).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()),
     }
 }
 
@@ -955,7 +994,8 @@ mod service_tests {
         let file = h.dir.join("plan.md");
         std::fs::write(&file, "### Task 1: One\n- Create: `src/one.ts`\n\n### Task 2: Two\nbody\n").unwrap();
         let amm = &mut h.amm;
-        let briefs = amm.import_plan(&run.id, &file).unwrap();
+        let md = std::fs::read_to_string(&file).unwrap();
+        let briefs = amm.import_plan(&run.id, &md, &file.to_string_lossy()).unwrap();
         let got: Vec<(String, BriefState, Vec<String>)> =
             briefs.iter().map(|b| (b.title.clone(), b.state, b.scope.clone())).collect();
         assert_eq!(
@@ -1186,12 +1226,53 @@ mod lifecycle_tests {
         amm.cancel(&b.id).unwrap();
         let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &wt);
         assert!(check.is_ok());
-        assert_eq!(amm.finish_bind(&w.id, check).unwrap_err(), "brief was cancelled");
+        assert_eq!(amm.finish_bind(&w.id, "agent-1", check).unwrap_err(), "brief was cancelled");
         let after = amm.store.get::<Worker>(&w.id).unwrap();
         assert_eq!(after.state, WorkerState::Cancelled);
         assert_eq!((after.branch, after.base_sha), (None, None));
         // The claim's worktree (cwd) is left as the claim wrote it; finish_bind adds nothing.
         assert_eq!(after.worktree, w.worktree);
+    }
+
+    // Not in the TS suite: a validation that finishes after another agent took the worker must not touch it.
+    #[test]
+    fn finish_bind_refuses_when_another_agent_holds_the_worker() {
+        let (mut h, run, b, repo) = started(DEFAULT_LIMITS);
+        let amm = &mut h.amm;
+        let wt = wt(&repo);
+        let BindClaim::Claimed(w) = amm.claim_bind(&b.id, "agent-1", &wt).unwrap() else { panic!("claim") };
+        amm.store.put(&Worker { agent_id: Some("agent-2".into()), ..w.clone() }).unwrap();
+        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &wt);
+        let e = amm.finish_bind(&w.id, "agent-1", check).unwrap_err();
+        assert!(e.contains("another agent"), "{e}");
+        let after = amm.store.get::<Worker>(&w.id).unwrap();
+        assert_eq!((after.agent_id.as_deref(), after.state, after.branch), (Some("agent-2"), WorkerState::Running, None));
+    }
+
+    // Not in the TS suite: the refusal names what actually happened to the worker.
+    #[test]
+    fn finish_bind_after_a_sweep_says_the_worker_was_lost() {
+        let (mut h, run, b, repo) = started(Limits { lease_ms: 1000, ..DEFAULT_LIMITS });
+        let wt = wt(&repo);
+        let BindClaim::Claimed(w) = h.amm.claim_bind(&b.id, "agent-1", &wt).unwrap() else { panic!("claim") };
+        h.clock.advance(1001);
+        h.amm.sweep().unwrap();
+        let check = validate_worktree(Path::new(&h.amm.run(&run.id).unwrap().repo), &wt);
+        assert_eq!(h.amm.finish_bind(&w.id, "agent-1", check).unwrap_err(), "worker lost");
+        assert_eq!(h.amm.store.get::<Worker>(&w.id).unwrap().base_sha, None);
+    }
+
+    // Not in the TS suite: ties on started_at resolve to the earliest id, whatever the store's map order.
+    #[test]
+    fn worker_lookups_break_started_at_ties_by_the_earliest_id() {
+        let (mut h, _run, b, _repo) = started(DEFAULT_LIMITS);
+        let amm = &mut h.amm;
+        let w = amm.worker_for_brief(&b.id).unwrap();
+        for id in ["w1", "w0", "w2"] {
+            amm.store.put(&Worker { id: id.into(), agent_id: Some("same".into()), ..w.clone() }).unwrap();
+        }
+        assert_eq!(amm.worker_for_brief(&b.id).unwrap().id, "w0");
+        assert_eq!(amm.worker_by_agent("same").unwrap().id, "w0");
     }
 
     // Not in the TS suite: the daemon resolves the base branch before it takes the lock.
@@ -1210,7 +1291,7 @@ mod lifecycle_tests {
         };
         amm.cancel(&b.id).unwrap();
         let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &repo);
-        assert!(amm.finish_bind(&w.id, check).is_err());
+        assert!(amm.finish_bind(&w.id, "agent-1", check).is_err());
         assert_eq!(amm.store.all::<Worker>()[0].state, WorkerState::Cancelled);
     }
 }
@@ -1314,7 +1395,10 @@ mod review_tests {
         let mut results = Vec::new();
         for (c, cwd) in [(c1, &wt1), (c2, &wt2)] {
             results.push(match c {
-                Ok(BindClaim::Claimed(w)) => amm.finish_bind(&w.id, validate_worktree(Path::new(&run_repo), cwd)),
+                Ok(BindClaim::Claimed(w)) => {
+                    let agent = w.agent_id.clone().unwrap();
+                    amm.finish_bind(&w.id, &agent, validate_worktree(Path::new(&run_repo), cwd))
+                }
                 Ok(BindClaim::Bound(w)) => Ok(w),
                 Err(e) => Err(e),
             });
@@ -1372,17 +1456,20 @@ mod review_tests {
         assert!(e1.to_string().contains("is cancelled"), "{e1}");
         let e2 = amm.dispatch(&run.id).unwrap_err();
         assert!(e2.to_string().contains("is cancelled"), "{e2}");
-        let e3 = amm.import_plan(&run.id, Path::new("/nonexistent")).unwrap_err();
+        let e3 = amm.import_plan(&run.id, "", "/nonexistent").unwrap_err();
         assert!(e3.to_string().contains("is cancelled"), "{e3}");
     }
 
     #[test]
     fn start_run_stores_the_real_path_when_it_exists() {
         let mut h = make_amm(DEFAULT_LIMITS);
+        let repo = resolve_repo(&h.dir);
+        assert_eq!(repo, h.dir.canonicalize().unwrap());
+        assert_eq!(resolve_repo(Path::new("/nonexistent-amm")), Path::new("/nonexistent-amm"));
         let run = h
             .amm
             .start_run(StartRun {
-                repo: h.dir.to_string_lossy().into_owned(),
+                repo: repo.to_string_lossy().into_owned(),
                 test_cmd: "t".into(),
                 base_branch: "main".into(),
             })
