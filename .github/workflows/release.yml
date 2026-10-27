@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml and plugin.json versions
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          plugin_version="$(python3 -c 'import json; print(json.load(open(".claude-plugin/plugin.json"))["version"])')"
+          echo "tag=$tag_version Cargo.toml=$cargo_version plugin.json=$plugin_version"
+          if [ "$tag_version" != "$cargo_version" ] || [ "$tag_version" != "$plugin_version" ]; then
+            echo "::error::Version mismatch between tag, Cargo.toml and plugin.json"
+            exit 1
+          fi
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            zig: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            zig: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install zig and cargo-zigbuild
+        if: matrix.zig
+        uses: mlugg/setup-zig@v1
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build (zigbuild)
+        if: matrix.zig
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+      - name: Build (native)
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p dist-out
+          cp target/${{ matrix.target }}/release/amm dist-out/amm
+          tar -C dist-out -czf amm-${{ matrix.target }}.tar.gz amm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amm-${{ matrix.target }}
+          path: amm-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: amm-*
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz
