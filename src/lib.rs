@@ -1,3 +1,4 @@
+pub mod checks;
 pub mod config;
 pub mod git;
 pub mod plan_import;
