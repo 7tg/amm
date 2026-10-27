@@ -178,7 +178,7 @@ fn finish(routes: Router<AppState>, state: AppState) -> Router {
 }
 
 pub fn router(state: AppState) -> Router {
-    let routes = Router::new().route("/health", any(health)).route("/api/{op}", any(api)).route("/hook/{event}", any(hook));
+    let routes = Router::new().route("/health", any(health)).route("/api/{op}", any(api)).route("/hook/{event}", any(hook)).merge(crate::dashboard::routes());
     finish(routes, state)
 }
 

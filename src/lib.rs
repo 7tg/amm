@@ -1,6 +1,8 @@
 pub mod checks;
 pub mod config;
+pub mod cost;
 pub mod daemon;
+pub mod dashboard;
 pub mod git;
 pub mod hook_client;
 pub mod hooks;
