@@ -203,9 +203,10 @@ pub async fn run_daemon(opts: DaemonOpts) -> DaemonResult<Option<DaemonHandle>> 
                 tick.tick().await;
                 let (amm, last_activity) = (amm.clone(), last_activity.clone());
                 // Sweeping writes to sqlite: keep it off the async workers. A panic surfaces as a JoinError.
+                let shared = amm.clone();
                 let idle = tokio::task::spawn_blocking(move || {
-                    let mut a = amm.lock().unwrap_or_else(|e| e.into_inner());
-                    match a.sweep() {
+                    let mut a = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let idle = match a.sweep() {
                         Err(e) => {
                             eprintln!("amm: sweep failed: {e}");
                             false
@@ -213,16 +214,24 @@ pub async fn run_daemon(opts: DaemonOpts) -> DaemonResult<Option<DaemonHandle>> 
                         Ok(()) => {
                             now_ms() - last_activity.load(Ordering::Relaxed) > idle_ms
                                 && a.active_workers(None).is_empty()
+                                && a.merging.is_empty()
                         }
-                    }
+                    };
+                    // Resumes merge queues that stalled or were cut off by a restart.
+                    let runs = a.runs_to_integrate();
+                    (idle && runs.is_empty(), runs)
                 })
                 .await;
                 match idle {
-                    Ok(true) => {
-                        shutdown.send_replace(true);
-                        return;
+                    Ok((idle, runs)) => {
+                        for run_id in runs {
+                            tokio::spawn(crate::integration::integrate(amm.clone(), run_id));
+                        }
+                        if idle {
+                            shutdown.send_replace(true);
+                            return;
+                        }
                     }
-                    Ok(false) => {}
                     Err(e) => eprintln!("amm: sweep failed: {e}"),
                 }
             }

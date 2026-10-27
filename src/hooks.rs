@@ -442,8 +442,11 @@ async fn subagent_stop(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInpu
     };
     let mut amm = lock(state);
     if problems.is_empty() {
-        if let Err(e) = amm.complete(&checking, gated_sha) {
-            log_err("complete", e);
+        match amm.complete(&checking, gated_sha) {
+            // The merge queue runs in the background; the worker stops now.
+            Ok(true) => drop(tokio::spawn(crate::integration::integrate(state.clone(), checking.run_id.clone()))),
+            Ok(false) => {}
+            Err(e) => log_err("complete", e),
         }
         return Ok(allow());
     }
@@ -1142,7 +1145,8 @@ mod tests {
         {
             let mut amm = state.lock().unwrap();
             let r = amm.run(&run.id).unwrap();
-            amm.store.put(&Run { integration_head: Some(tip.clone()), ..r }).unwrap();
+            let iwt = Some(iwt.to_string_lossy().into_owned());
+            amm.store.put(&Run { integration_head: Some(tip.clone()), integration_worktree: iwt, ..r }).unwrap();
         }
         let h = Bound { state, repo, b, dir };
         h.hook("PreToolUse", json!({ "tool_name": "mcp__plugin_amm_amm__amm_brief_get", "tool_input": { "token": h.b.id } }))
@@ -1156,11 +1160,23 @@ mod tests {
         let (h, tip) = worker_on_integration().await;
         std::fs::write(h.repo.join("src/b.ts"), "b\n").unwrap();
         h.report(ReportStatus::Done);
+        let main = h.repo.parent().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
         let out = h.hook("SubagentStop", json!({})).await;
         assert_eq!(out, json!({}));
         let gated = h.worker().gated_sha.unwrap();
-        assert_eq!(git_in(&h.repo, &["merge-base", "--is-ancestor", &tip, &gated]), "");
-        assert_eq!(git_in(&h.repo, &["diff", "--name-only", &tip, &gated]), "src/b.ts");
+        assert_eq!(git_in(&main, &["merge-base", "--is-ancestor", &tip, &gated]), "");
+        assert_eq!(git_in(&main, &["diff", "--name-only", &tip, &gated]), "src/b.ts");
+        // Passing the gate starts the merge queue in the background.
+        let merged = async {
+            while h.amm().brief(&h.b.id).unwrap().state != BriefState::Merged {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), merged).await.expect("the brief was never merged");
+        let run = h.amm().run(&h.b.run_id).unwrap();
+        assert_eq!(run.merges, 1);
+        assert_eq!(run.integration_head, Some(git_in(&main, &["rev-parse", &run.integration_branch])));
+        assert_eq!(git_in(&main, &["rev-parse", &format!("{}^2", run.integration_branch)]), gated);
     }
 
     #[tokio::test]

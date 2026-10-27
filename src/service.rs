@@ -14,7 +14,21 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
 pub const ACTIVE: [WorkerState; 3] = [WorkerState::Starting, WorkerState::Running, WorkerState::Checking];
-const NOTABLE: [&str; 6] = ["done", "escalate", "failed", "blocked", "lost", "cancel"];
+const NOTABLE: [&str; 13] = [
+    "done",
+    "escalate",
+    "failed",
+    "blocked",
+    "lost",
+    "cancel",
+    "merged",
+    "integration_failed",
+    "conflict",
+    "run_done",
+    "run_failed",
+    "integration_error",
+    "scope_violation",
+];
 /// Worker slots re-acquired outside dispatch never count against capacity (TS: Infinity).
 const UNBOUNDED: usize = usize::MAX;
 
@@ -193,6 +207,8 @@ pub struct Amm {
     pub env: Env,
     /// Most notable events one `status` call reports; the rest wait for the next call.
     pub status_limit: i64,
+    /// Runs whose merge queue is running in this process (see `integration::integrate`).
+    pub merging: std::collections::HashSet<String>,
 }
 
 impl Amm {
@@ -211,7 +227,7 @@ impl Amm {
             let remaining = (w.last_event_at + limits.lease_ms + extra - t).max(1);
             sem.try_acquire("workers", &w.id, UNBOUNDED, remaining);
         }
-        Amm { store, sem, limits, now, env, status_limit: 10000 }
+        Amm { store, sem, limits, now, env, status_limit: 10000, merging: Default::default() }
     }
 
     fn t(&self) -> i64 {
@@ -826,6 +842,13 @@ impl Amm {
             return Ok(false);
         }
         let b = self.brief(&w.brief_id)?;
+        self.escalate_brief(&b, Some(&w.id), reason)?;
+        Ok(true)
+    }
+
+    /// Requeues `b` one tier up with a note saying why, or fails it at the top tier. Writes `b` as given (plus the
+    /// changes): callers pass a fresh copy they have checked the state of.
+    pub(crate) fn escalate_brief(&mut self, b: &Brief, worker_id: Option<&str>, reason: &str) -> AmmResult<()> {
         let mut notes = b.notes.clone();
         notes.push(format!("attempt {} ({}) was stopped: {reason}", b.attempt, tier_name(b.tier)));
         match next_tier(b.tier) {
@@ -842,16 +865,32 @@ impl Amm {
                 self.event(
                     "escalate",
                     Some(&b.run_id),
-                    Some(&w.id),
+                    worker_id,
                     serde_json::json!({ "briefId": b.id, "from": b.tier, "to": tier, "reason": reason }),
                 )?;
             }
             None => {
                 self.store.put(&Brief { notes, state: BriefState::Failed, ..b.clone() })?;
-                self.event("failed", Some(&b.run_id), Some(&w.id), serde_json::json!({ "briefId": b.id, "reason": reason }))?;
+                self.event("failed", Some(&b.run_id), worker_id, serde_json::json!({ "briefId": b.id, "reason": reason }))?;
             }
         }
-        Ok(true)
+        Ok(())
+    }
+
+    /// Writes the patch only if the brief is still in one of the `from` states.
+    pub(crate) fn brief_transition(
+        &mut self,
+        brief_id: &str,
+        from: &[BriefState],
+        patch: impl FnOnce(&mut Brief),
+    ) -> AmmResult<Option<Brief>> {
+        let mut next = self.brief(brief_id)?;
+        if !from.contains(&next.state) {
+            return Ok(None);
+        }
+        patch(&mut next);
+        self.store.put(&next)?;
+        Ok(Some(next))
     }
 
     pub fn nudge(&mut self, brief_id: &str, message: &str) -> AmmResult<()> {
@@ -874,7 +913,7 @@ impl Amm {
             self.store.put(&Run { state: RunState::Cancelled, ..r })?;
         }
         for b in briefs {
-            if matches!(b.state, BriefState::Done | BriefState::Cancelled) {
+            if matches!(b.state, BriefState::Done | BriefState::Cancelled | BriefState::Merged) {
                 continue;
             }
             let w = self.worker_for_brief(&b.id);
@@ -937,6 +976,7 @@ fn run_state_name(s: RunState) -> &'static str {
         RunState::Active => "active",
         RunState::Done => "done",
         RunState::Cancelled => "cancelled",
+        RunState::Failed => "failed",
     }
 }
 
@@ -949,6 +989,8 @@ fn brief_state_name(s: BriefState) -> &'static str {
         BriefState::Blocked => "blocked",
         BriefState::Failed => "failed",
         BriefState::Cancelled => "cancelled",
+        BriefState::Merging => "merging",
+        BriefState::Merged => "merged",
     }
 }
 

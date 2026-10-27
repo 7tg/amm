@@ -18,6 +18,8 @@ pub enum RunState {
     Active,
     Done,
     Cancelled,
+    /// Integration stopped: amm/<run> no longer matches what amm left there.
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,10 +28,15 @@ pub enum BriefState {
     Draft,
     Queued,
     Running,
+    /// Passed the gate; waiting in the merge queue.
     Done,
     Blocked,
     Failed,
     Cancelled,
+    /// Being merged into the integration branch.
+    Merging,
+    /// Merged, and the integration tests passed.
+    Merged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
