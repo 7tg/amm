@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -13,7 +14,11 @@ export async function ensureDaemon(home = ammHome()): Promise<Lock> {
   if (lock && (await isHealthy(lock))) return lock;
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   const log = fs.openSync(path.join(home, 'daemon.log'), 'a');
-  spawn(process.execPath, [process.argv[1], 'daemon'], { detached: true, stdio: ['ignore', log, log], env: process.env }).unref();
+  try {
+    spawn(process.execPath, [fileURLToPath(import.meta.url), 'daemon'], { detached: true, stdio: ['ignore', log, log], env: process.env }).unref();
+  } finally {
+    fs.closeSync(log);
+  }
   for (let i = 0; i < 50; i++) {
     await new Promise((r) => setTimeout(r, 100));
     lock = readLock(home);
@@ -30,13 +35,14 @@ async function callDaemon(op: string, args: Record<string, unknown>): Promise<un
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-amm-token': lock.token },
         body: JSON.stringify(args),
+        signal: AbortSignal.timeout(30_000),
       });
       const body = (await res.json()) as { result?: unknown; error?: string };
       if (!res.ok) throw new Error(body.error ?? `http ${res.status}`);
       return body.result;
     } catch (e) {
-      // A TypeError means the connection failed: the daemon may have just shut down. Retry once.
-      if (attempt > 0 || !(e instanceof TypeError)) throw e;
+      // ECONNREFUSED means the request never reached a daemon (it may have just shut down), so one retry is safe.
+      if (attempt > 0 || (e as { cause?: { code?: string } }).cause?.code !== 'ECONNREFUSED') throw e;
     }
   }
 }

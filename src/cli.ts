@@ -7,7 +7,11 @@ if (cmd === 'daemon') {
   const d = await runDaemon({ port });
   if (!d) process.exit(0);
   console.log(`amm daemon pid ${process.pid} on 127.0.0.1:${d.port}`);
-  for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => void d.close().then(() => process.exit(0)));
+  for (const sig of ['SIGINT', 'SIGTERM'] as const)
+    process.on(sig, () => {
+      setTimeout(() => process.exit(1), 5000).unref();
+      void d.close().then(() => process.exit(0));
+    });
 } else if (cmd === 'shim') {
   await runShim();
 } else {
