@@ -1,7 +1,7 @@
 //! Claude Code hook handlers. Each handler locks `Amm` only for synchronous reads and guarded transitions; git and
 //! checks run on the blocking pool with the lock released (see the plan's Concurrency section).
 use crate::checks::run_checks;
-use crate::config::{Limits, tool_name};
+use crate::config::{Limits, no_progress_limit, tool_name};
 use crate::git::{changed_files, commit_all, committed_files, git, is_ancestor, worktree_info};
 use crate::rules::{Counters, RuleContext, ToolEvent, Verdict, evaluate, is_edit_tool};
 use crate::scope::in_scope;
@@ -383,7 +383,11 @@ fn post_tool(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput, event: 
     let b = amm.brief(&w.brief_id)?;
     let failed = event == "PostToolUseFailure" || bash_failed(input.tool_response.as_ref());
     let ti = input.tool_input.clone().unwrap_or_else(|| json!({}));
-    let ctx = RuleContext { limits: amm.limits.clone(), max_turns: b.max_turns, checks: b.checks.clone() };
+    let ctx = RuleContext {
+        limits: amm.limits.clone(),
+        no_progress: no_progress_limit(&amm.limits, b.tier),
+        max_turns: b.max_turns, checks: b.checks.clone(),
+    };
     let tool_event = ToolEvent { tool: input.tool_name.clone().unwrap_or_default(), input: ti.clone(), failed };
     let (c, verdict) = evaluate(&counters(&w), &tool_event, &ctx);
     let updated = amm.update_counters(&w, c)?;
