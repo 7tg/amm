@@ -28,6 +28,7 @@ pub struct HookInput {
     pub tool_input: Option<Value>,
     pub tool_response: Option<Value>,
     pub agent_transcript_path: Option<String>,
+    pub transcript_path: Option<String>,
     pub stop_hook_active: Option<bool>,
 }
 
@@ -146,7 +147,7 @@ fn is_worker(input: &HookInput) -> bool {
 fn main_session(state: &Arc<Mutex<Amm>>, event: &str, input: &HookInput) -> AmmResult<Value> {
     static RUN_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\br(?:[0-9a-f]{16}|[0-9a-f]{6})\b").unwrap());
     let mut amm = lock(state);
-    amm.touch_session(&input.session_id, &input.cwd)?;
+    amm.touch_session(&input.session_id, &input.cwd, input.transcript_path.as_deref())?;
     if event == "PostToolUse" && input.tool_name.as_deref().is_some_and(|t| t.ends_with("amm_run_start")) {
         let text = serde_json::to_string(input.tool_response.as_ref().unwrap_or(&Value::String(String::new())))
             .unwrap_or_default();

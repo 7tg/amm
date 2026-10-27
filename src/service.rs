@@ -209,6 +209,8 @@ pub struct Amm {
     pub status_limit: i64,
     /// Runs whose merge queue is running in this process (see `integration::integrate`).
     pub merging: std::collections::HashSet<String>,
+    /// Main-session transcript paths by session id, from hook input. In memory: every amm tool call refreshes it.
+    pub session_transcripts: std::collections::HashMap<String, String>,
 }
 
 impl Amm {
@@ -227,7 +229,7 @@ impl Amm {
             let remaining = (w.last_event_at + limits.lease_ms + extra - t).max(1);
             sem.try_acquire("workers", &w.id, UNBOUNDED, remaining);
         }
-        Amm { store, sem, limits, now, env, status_limit: 10000, merging: Default::default() }
+        Amm { store, sem, limits, now, env, status_limit: 10000, merging: Default::default(), session_transcripts: Default::default() }
     }
 
     fn t(&self) -> i64 {
@@ -1001,8 +1003,11 @@ impl Amm {
         Ok(())
     }
 
-    pub fn touch_session(&mut self, id: &str, cwd: &str) -> AmmResult<()> {
+    pub fn touch_session(&mut self, id: &str, cwd: &str, transcript_path: Option<&str>) -> AmmResult<()> {
         let now = self.t();
+        if let Some(p) = transcript_path.filter(|p| !p.is_empty()) {
+            self.session_transcripts.insert(id.to_string(), p.to_string());
+        }
         let next = match self.store.get::<Session>(id) {
             Some(s) => Session { last_seen: now, ..s },
             None => Session { id: id.to_string(), cwd: cwd.to_string(), first_seen: now, last_seen: now },
