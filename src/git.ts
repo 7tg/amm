@@ -15,10 +15,16 @@ export function git(cwd: string, args: string[]): Promise<GitResult> {
   });
 }
 
-/** Files that differ from `baseSha` (committed or not) plus untracked files, relative to the repo root. */
+/** Files that differ from `baseSha` (committed or not) plus untracked files, relative to the repo root.
+ * Renames are reported as a deletion plus an addition, so both paths are listed. Throws if git fails. */
 export async function changedFiles(cwd: string, baseSha: string): Promise<string[]> {
-  const diff = await git(cwd, ['diff', '--name-only', baseSha]);
-  const untracked = await git(cwd, ['ls-files', '--others', '--exclude-standard']);
-  const all = [...diff.stdout.split('\n'), ...untracked.stdout.split('\n')].filter(Boolean);
+  const top = await git(cwd, ['rev-parse', '--show-toplevel']);
+  if (top.code !== 0) throw new Error(`git rev-parse --show-toplevel failed: ${top.stderr.trim()}`);
+  const root = top.stdout.trim();
+  const diff = await git(root, ['diff', '--name-only', '-z', '--no-renames', baseSha]);
+  if (diff.code !== 0) throw new Error(`git diff failed: ${diff.stderr.trim()}`);
+  const untracked = await git(root, ['ls-files', '--others', '--exclude-standard', '-z']);
+  if (untracked.code !== 0) throw new Error(`git ls-files failed: ${untracked.stderr.trim()}`);
+  const all = [...diff.stdout.split('\0'), ...untracked.stdout.split('\0')].filter(Boolean);
   return [...new Set(all)];
 }
