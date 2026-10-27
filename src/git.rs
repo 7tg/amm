@@ -50,6 +50,18 @@ fn killpg(pgid: u32) {
 }
 
 fn run(cwd: &Path, args: &[&str], env: &[(String, String)], max: usize, timeout: Duration) -> Result<GitResult, String> {
+    run_in(cwd, args, env, None, max, timeout)
+}
+
+/// `run`, writing `input` to git's stdin (else stdin is /dev/null).
+fn run_in(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(String, String)],
+    input: Option<Vec<u8>>,
+    max: usize,
+    timeout: Duration,
+) -> Result<GitResult, String> {
     let spawned = Command::new("git")
         .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"])
         .args(args)
@@ -61,13 +73,21 @@ fn run(cwd: &Path, args: &[&str], env: &[(String, String)], max: usize, timeout:
         .envs(env.iter().map(|(k, v)| (k, v)))
         // Own process group, so a timeout also kills filters or helpers git started.
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => return Ok(GitResult { code: 1, stdout: String::new(), stderr: e.to_string() }),
+    };
+    // Fed from a thread so a full stdout pipe can never deadlock against a full stdin pipe.
+    let writer = match (input, child.stdin.take()) {
+        (Some(bytes), Some(mut stdin)) => Some(std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&bytes);
+        })),
+        _ => None,
     };
     let pid = child.id();
     let timed_out = Arc::new(AtomicBool::new(false));
@@ -90,6 +110,9 @@ fn run(cwd: &Path, args: &[&str], env: &[(String, String)], max: usize, timeout:
     }
     // Reading stdout to EOF (or killing) lets stderr finish, then the child can be reaped.
     let err = err_thread.join().map_err(|_| "git stderr reader panicked".to_string());
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
     // Stop the watchdog before reaping, so it can never signal a reused pid.
     drop(done_tx);
     let _ = watchdog.join();
@@ -204,33 +227,144 @@ pub fn changed_files(root: &Path, base_sha: &str, sha: &str) -> Result<Vec<Strin
 /// Name and email amm commits under.
 pub const AMM_IDENT: (&str, &str) = ("amm", "amm@localhost");
 
-/// Stages every change in the worktree `root` (`git add -A`) and commits it as `amm <amm@localhost>`, with no hook,
-/// signing, filter or automatic gc. Returns the new HEAD; on a clean tree it returns HEAD and makes no commit.
-/// Blocking. Errors if any git call fails or times out.
-pub fn commit_all(root: &Path, message: &str) -> Result<String, String> {
-    let mut env = no_filters(root)?;
+/// A private directory under the temp dir, removed on drop.
+struct PrivateDir(PathBuf);
+
+impl PrivateDir {
+    fn new() -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        for _ in 0..8 {
+            let p = std::env::temp_dir().join(format!("amm-index-{:016x}", rand::random::<u64>()));
+            // create (not create_all) fails if the path exists, so nobody else's directory is ever used.
+            match std::fs::DirBuilder::new().mode(0o700).create(&p) {
+                Ok(()) => return Ok(PrivateDir(p)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("cannot create a private index: {e}")),
+            }
+        }
+        Err("cannot create a private index".into())
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A path C-quoted the way `--stdin-paths` unquotes it, so any byte (newlines, quotes) survives.
+fn c_quote(path: &str) -> Vec<u8> {
+    let mut out = vec![b'"'];
+    for b in path.bytes() {
+        match b {
+            b'"' | b'\\' => out.extend([b'\\', b]),
+            0..0x20 | 0x7f => out.extend(format!("\\{b:03o}").bytes()),
+            _ => out.push(b),
+        }
+    }
+    out.push(b'"');
+    out
+}
+
+/// The NUL-separated names in `out`, refusing any git could not give as UTF-8 (they would be mangled).
+fn names(out: &str) -> Result<Vec<&str>, String> {
+    let v: Vec<&str> = out.split('\0').filter(|s| !s.is_empty()).collect();
+    if v.iter().any(|n| n.contains('\u{FFFD}')) {
+        return Err("a file name is not valid UTF-8".into());
+    }
+    Ok(v)
+}
+
+/// Commits the worktree `root` as it is on disk on top of `parent`, as `amm <amm@localhost>`, then moves
+/// `refs/heads/<branch>` from `parent` to the commit (compare-and-swap). Returns the commit, or `parent` itself when
+/// nothing changed. The worker's index is never read: a private index is seeded from `parent`, every file `parent`
+/// tracks plus every untracked, non-ignored file is hashed with `hash-object --no-filters`, with its mode (exec bit,
+/// symlink) from `lstat`, and files gone from disk are deleted. So no filter, hook or signer runs, and skip-worktree,
+/// assume-unchanged or intent-to-add entries change nothing. Submodules are kept as `parent` has them. Blocking.
+/// Errors if any git call fails or times out, or the branch is no longer on `parent`.
+pub fn commit_all(root: &Path, branch: &str, parent: &str, message: &str) -> Result<String, String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = PrivateDir::new()?;
     let (name, email) = AMM_IDENT;
+    let mut env: Vec<(String, String)> = vec![
+        ("GIT_INDEX_FILE".into(), dir.0.join("index").to_string_lossy().into_owned()),
+        ("GIT_ATTR_NOSYSTEM".into(), "1".into()),
+    ];
     for who in ["AUTHOR", "COMMITTER"] {
         env.push((format!("GIT_{who}_NAME"), name.into()));
         env.push((format!("GIT_{who}_EMAIL"), email.into()));
     }
-    raw_env(root, &["add", "-A", "--", "."], &env)?;
-    let staged = run(root, &["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"], &env, MAX_OUTPUT, GIT_TIMEOUT)?;
-    if staged.code > 1 {
-        return Err(format!("git diff failed: {}", staged.stderr.trim()));
+    let g = |args: &[&str], input: Option<Vec<u8>>| -> Result<String, String> {
+        let r = run_in(root, args, &env, input, MAX_OUTPUT, GIT_TIMEOUT)?;
+        if r.code != 0 {
+            return Err(format!("git {} failed: {}", args.first().copied().unwrap_or(""), r.stderr.trim()));
+        }
+        Ok(r.stdout)
+    };
+    let parent_tree = g(&["rev-parse", "--verify", "--end-of-options", &format!("{parent}^{{tree}}")], None)?.trim().to_string();
+    g(&["read-tree", "--end-of-options", parent], None)?;
+    let listing = g(&["ls-tree", "-r", "-z", "--full-tree", "--end-of-options", parent], None)?;
+    let mut paths: Vec<String> = Vec::new();
+    for entry in names(&listing)? {
+        let (meta, path) = entry.split_once('\t').ok_or("unexpected ls-tree output")?;
+        if !meta.starts_with("160000 ") {
+            paths.push(path.to_string());
+        }
     }
-    if staged.code == 1 {
-        let cfg = ["-c", "commit.gpgsign=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false"];
-        let ident = [format!("user.name={name}"), format!("user.email={email}")];
-        let args: Vec<&str> = cfg
-            .iter()
-            .copied()
-            .chain(ident.iter().flat_map(|i| ["-c", i.as_str()]))
-            .chain(["commit", "-q", "--no-verify", "--no-gpg-sign", "-m", message])
-            .collect();
-        raw_env(root, &args, &env)?;
+    let others = g(&["ls-files", "--others", "--exclude-standard", "--full-name", "-z"], None)?;
+    // A trailing slash is a nested repository: not amm's to commit.
+    paths.extend(names(&others)?.into_iter().filter(|p| !p.ends_with('/')).map(str::to_string));
+    let mut info: Vec<u8> = Vec::new();
+    let mut entry = |mode: &str, sha: &str, path: &str| {
+        info.extend_from_slice(format!("{mode} {sha}\t{path}").as_bytes());
+        info.push(0);
+    };
+    let (mut files, mut file_modes) = (Vec::new(), Vec::new());
+    for path in &paths {
+        match std::fs::symlink_metadata(root.join(path)) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = std::fs::read_link(root.join(path)).map_err(|e| format!("{path}: {e}"))?;
+                let sha = g(&["hash-object", "-w", "--no-filters", "--stdin"], Some(target.as_os_str().as_bytes().to_vec()))?;
+                entry("120000", sha.trim(), path);
+            }
+            Ok(m) if m.file_type().is_file() => {
+                files.push(path.as_str());
+                file_modes.push(if m.permissions().mode() & 0o100 != 0 { "100755" } else { "100644" });
+            }
+            // Gone, or replaced by a directory (whose files are listed on their own): the path is deleted.
+            Ok(m) if m.file_type().is_dir() => entry("0", &"0".repeat(40), path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => entry("0", &"0".repeat(40), path),
+            Ok(_) => return Err(format!("{path} is not a regular file, symlink or directory")),
+            Err(e) => return Err(format!("{path}: {e}")),
+        }
     }
-    Ok(raw_env(root, &["rev-parse", "--verify", "HEAD^{commit}"], &env)?.trim().to_string())
+    if !files.is_empty() {
+        let input: Vec<u8> = files.iter().flat_map(|p| [c_quote(p), vec![b'\n']].concat()).collect();
+        let out = g(&["hash-object", "-w", "--no-filters", "--stdin-paths"], Some(input))?;
+        let shas: Vec<&str> = out.lines().collect();
+        if shas.len() != files.len() {
+            return Err("git hash-object returned the wrong number of hashes".into());
+        }
+        for ((path, mode), sha) in files.iter().zip(&file_modes).zip(shas) {
+            entry(mode, sha, path);
+        }
+    }
+    g(&["update-index", "-z", "--index-info"], Some(info))?;
+    let tree = g(&["write-tree"], None)?.trim().to_string();
+    if tree == parent_tree {
+        return Ok(parent.to_string());
+    }
+    let new = g(
+        &["-c", "commit.gpgsign=false", "commit-tree", "--no-gpg-sign", "-p", parent, "-m", message, "--end-of-options", &tree],
+        None,
+    )?
+    .trim()
+    .to_string();
+    g(&["update-ref", "-m", "amm: gate commit", "--end-of-options", &format!("refs/heads/{branch}"), &new, parent], None)?;
+    // Best effort: the worker's own index now matches the commit. read-tree without -u touches no file.
+    let _ = git(root, &["read-tree", "-q", "--end-of-options", &new]);
+    Ok(new)
 }
 
 /// Files that differ between the commits `base_sha` and `sha` (trees only, no working tree). Errors if git fails.
@@ -476,7 +610,7 @@ mod tests {
         let base = head(&dir);
         fs::write(dir.join("a.txt"), "changed\n").unwrap();
         fs::write(dir.join("new.txt"), "n\n").unwrap();
-        let sha = commit_all(&dir, "amm(b1): t").unwrap();
+        let sha = commit_all(&dir, "main", &base, "amm(b1): t").unwrap();
         assert_eq!(sha, head(&dir));
         assert_ne!(sha, base);
         assert_eq!(show(&dir, "%an <%ae>|%cn <%ce>|%s|%P"), format!("amm <amm@localhost>|amm <amm@localhost>|amm(b1): t|{base}"));
@@ -489,7 +623,7 @@ mod tests {
     fn commit_all_on_a_clean_tree_returns_head_without_a_commit() {
         let dir = repo();
         let base = head(&dir);
-        assert_eq!(commit_all(&dir, "m").unwrap(), base);
+        assert_eq!(commit_all(&dir, "main", &base, "m").unwrap(), base);
         assert_eq!(head(&dir), base);
     }
 
@@ -509,18 +643,63 @@ mod tests {
         git_in(&dir, &["config", "commit.gpgsign", "true"]);
         git_in(&dir, &["config", "gpg.program", hooks.join("pre-commit").to_str().unwrap()]);
         plant_filter(&dir, &marker, &format!("touch {}; cat", marker.display()));
-        let sha = commit_all(&dir, "m").unwrap();
+        let sha = commit_all(&dir, "main", &head(&dir), "m").unwrap();
         assert_eq!(sha, head(&dir));
         assert_eq!(show(&dir, "%G?"), "N");
         assert!(!marker.exists(), "a planted hook, signer or filter ran");
     }
 
     #[test]
-    fn commit_all_errors_when_git_cannot_commit() {
+    fn commit_all_errors_when_the_branch_moved_or_is_locked() {
         let dir = repo();
+        let base = head(&dir);
         fs::write(dir.join("a.txt"), "changed\n").unwrap();
-        fs::write(dir.join(".git/index.lock"), "").unwrap();
-        assert!(commit_all(&dir, "m").is_err());
+        assert!(commit_all(&dir, "main", &"0".repeat(40), "m").is_err());
+        assert_eq!(head(&dir), base);
+        fs::write(dir.join(".git/refs/heads/main.lock"), "").unwrap();
+        assert!(commit_all(&dir, "main", &base, "m").is_err());
+        assert_eq!(head(&dir), base);
+    }
+
+    #[test]
+    fn commit_all_ignores_the_index_and_commits_skip_worktree_and_intent_to_add_files() {
+        let dir = repo();
+        let base = head(&dir);
+        git_in(&dir, &["update-index", "--skip-worktree", "a.txt"]);
+        fs::write(dir.join("a.txt"), "hidden change\n").unwrap();
+        fs::write(dir.join("ita.txt"), "i\n").unwrap();
+        git_in(&dir, &["add", "-N", "ita.txt"]);
+        let sha = commit_all(&dir, "main", &base, "m").unwrap();
+        let files = git(&dir, &["diff", "--name-only", &base, &sha]).unwrap().stdout;
+        assert_eq!(sorted(files.lines().map(str::to_string).collect()), ["a.txt", "ita.txt"]);
+        assert_eq!(git(&dir, &["show", &format!("{sha}:a.txt")]).unwrap().stdout, "hidden change\n");
+    }
+
+    #[test]
+    fn commit_all_commits_deletions_exec_bits_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = repo();
+        fs::write(dir.join("gone.txt"), "g\n").unwrap();
+        fs::write(dir.join("run.sh"), "#!/bin/sh\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-qm", "more"]);
+        let base = head(&dir);
+        fs::remove_file(dir.join("gone.txt")).unwrap();
+        fs::set_permissions(dir.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("a.txt", dir.join("link")).unwrap();
+        fs::write(dir.join("we\"ird\nname"), "w\n").unwrap();
+        fs::write(dir.join("ünï.txt"), "u\n").unwrap();
+        let sha = commit_all(&dir, "main", &base, "m").unwrap();
+        let tree = git(&dir, &["ls-tree", "-r", "-z", &sha]).unwrap().stdout;
+        let entries: Vec<&str> = tree.split('\0').filter(|e| !e.is_empty()).collect();
+        let mode = |p: &str| entries.iter().find(|e| e.ends_with(&format!("\t{p}"))).map(|e| e.split(' ').next().unwrap().to_string());
+        assert_eq!(mode("gone.txt"), None);
+        assert_eq!(mode("run.sh").as_deref(), Some("100755"));
+        assert_eq!(mode("link").as_deref(), Some("120000"));
+        assert_eq!(git(&dir, &["cat-file", "-p", &format!("{sha}:link")]).unwrap().stdout, "a.txt");
+        assert_eq!(mode("we\"ird\nname").as_deref(), Some("100644"));
+        assert_eq!(mode("a.txt").as_deref(), Some("100644"));
+        assert_eq!(git(&dir, &["show", &format!("{sha}:ünï.txt")]).unwrap().stdout, "u\n");
     }
 
     #[test]

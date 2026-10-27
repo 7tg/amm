@@ -607,7 +607,7 @@ fn gate_problems(w: &Worker, b: &Brief, gate: &Gate, limits: &Limits, diff: &Dif
 /// file it changes since `base` must be in scope. A commit that fails these checks is taken back off the branch.
 fn commit_work(w: &Worker, b: &Brief, wt: &str, base: &str, branch: &str, sha: &str, repo: &Path) -> Result<String, String> {
     let root = Path::new(wt);
-    let new = commit_all(root, &format!("amm({}): {}", b.id, b.title))
+    let new = commit_all(root, branch, sha, &format!("amm({}): {}", b.id, b.title))
         .map_err(|e| format!("amm could not commit your changes: {}", first_line(&e)))?;
     if new == sha {
         return Ok(new);
@@ -1098,8 +1098,9 @@ mod tests {
     async fn a_failed_commit_fails_the_gate() {
         let h = bound_worker(&[]).await;
         std::fs::write(h.repo.join("src/b.ts"), "b\n").unwrap();
-        let gitdir = git_in(&h.repo, &["rev-parse", "--absolute-git-dir"]);
-        std::fs::write(Path::new(&gitdir).join("index.lock"), "").unwrap();
+        let common = git_in(&h.repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+        let branch = h.worker().branch.unwrap();
+        std::fs::write(Path::new(&common).join(format!("refs/heads/{branch}.lock")), "").unwrap();
         h.report(ReportStatus::Done);
         let out = h.hook("SubagentStop", json!({})).await;
         assert_eq!(out["decision"], "block");
