@@ -338,6 +338,13 @@ fn merge_one(job: &Job) -> Outcome {
     }
 }
 
+/// Whether a failed run may resume: its integration worktree is amm's again, on `amm/<run>` at the recorded head,
+/// with nothing changed but ignored files. Blocking.
+pub fn check_resumable(repo: &Path, wt: &Path, branch: &str, head: &str) -> Result<(), String> {
+    verify_at(repo, wt, branch, head)?;
+    verify_clean(wt, branch, head)
+}
+
 /// After a restart: a brief left in `merging` means a merge may be half done. The branch may be on amm's head, or on
 /// a merge commit amm made of that head and one of the `stale` gated commits before it could record it; anything else
 /// was not amm's doing. Puts the branch and the worktree back on `head`.

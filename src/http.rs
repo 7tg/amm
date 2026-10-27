@@ -183,8 +183,19 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// API operations, named after the MCP tools without the "amm_" prefix. Results are kept small on purpose.
-pub const OPS: [&str; 10] =
-    ["run_start", "brief_add", "plan_import", "brief_update", "dispatch", "brief_get", "report", "status", "nudge", "cancel"];
+pub const OPS: [&str; 11] = [
+    "run_start",
+    "brief_add",
+    "plan_import",
+    "brief_update",
+    "dispatch",
+    "brief_get",
+    "report",
+    "status",
+    "nudge",
+    "cancel",
+    "resume",
+];
 
 fn args<T: DeserializeOwned>(body: Value) -> AmmResult<T> {
     serde_json::from_value(body).map_err(|e| AmmError(e.to_string()))
@@ -398,6 +409,27 @@ async fn run_op(s: &AppState, op: &str, body: Value) -> AmmResult<Value> {
             lock(amm).nudge(&a.brief_id, &a.message)?;
             json!("queued; delivered on the worker's next tool call")
         }
+        "resume" => {
+            let a: RunIdArgs = args(body)?;
+            let run = lock(amm).run(&a.run_id)?;
+            if run.state != crate::types::RunState::Failed {
+                // Same message the guarded transition gives, before any git work.
+                lock(amm).resume_run(&a.run_id)?;
+            }
+            let (Some(wt), Some(head)) = (run.integration_worktree.clone(), run.integration_head.clone()) else {
+                return Err(AmmError(format!("run {} has no integration worktree", run.id)));
+            };
+            let (repo, branch) = (run.repo.clone(), run.integration_branch.clone());
+            blocking(move || {
+                crate::integration::check_resumable(Path::new(&repo), Path::new(&wt), &branch, &head).map_err(|e| {
+                    AmmError(format!("cannot resume: {e}. Put {branch} back on {head} (git reset --hard {head} in {wt})"))
+                })
+            })
+            .await?;
+            lock(amm).resume_run(&a.run_id)?;
+            tokio::spawn(crate::integration::integrate(amm.clone(), a.run_id.clone()));
+            json!("resumed")
+        }
         "cancel" => {
             let a: CancelArgs = args(body)?;
             lock(amm).cancel(&a.id)?;
@@ -495,6 +527,31 @@ mod tests {
             assert_eq!(left, 0, "{setup}");
             assert!(lock(&s.amm).store.all::<crate::types::Run>().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn resume_restarts_a_failed_run_only_once_the_branch_is_back_where_amm_left_it() {
+        let repo = crate::testutil::init_repo();
+        let s = app(make_amm(DEFAULT_LIMITS).amm);
+        let id = run_op(&s, "run_start", json!({ "repo": repo, "test_cmd": "true" })).await.unwrap()["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(run_op(&s, "resume", json!({ "run_id": id })).await.unwrap_err().0.contains("not failed"));
+        let (wt, head) = {
+            let mut amm = lock(&s.amm);
+            let r = amm.run(&id).unwrap();
+            amm.store.put(&crate::types::Run { state: crate::types::RunState::Failed, ..r.clone() }).unwrap();
+            (std::path::PathBuf::from(r.integration_worktree.unwrap()), r.integration_head.unwrap())
+        };
+        let g = |a: &[&str]| crate::git::git(&wt, a).unwrap();
+        g(&["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "user"]);
+        let e = run_op(&s, "resume", json!({ "run_id": id })).await.unwrap_err().0;
+        assert!(e.contains("not on"), "{e}");
+        assert_eq!(lock(&s.amm).run(&id).unwrap().state, crate::types::RunState::Failed);
+        g(&["reset", "-q", "--hard", &head]);
+        run_op(&s, "resume", json!({ "run_id": id })).await.unwrap();
+        assert_eq!(lock(&s.amm).run(&id).unwrap().state, crate::types::RunState::Active);
     }
 
     #[tokio::test]

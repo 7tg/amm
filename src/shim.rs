@@ -231,6 +231,11 @@ pub fn tools() -> Vec<Tool> {
             "Cancel a brief, or all unfinished briefs of a run.",
             schema(json!({ "id": sd("brief id or run id") }), &["id"]),
         ),
+        Tool::new(
+            "amm_resume",
+            "Resume a run whose integration stopped, once amm/<run> is back on the commit amm recorded.",
+            schema(json!({ "run_id": s() }), &["run_id"]),
+        ),
     ]
 }
 

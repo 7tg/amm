@@ -911,6 +911,19 @@ impl Amm {
         self.event("nudge", Some(&w.run_id), Some(&w.id), serde_json::json!({ "briefId": brief_id, "message": message }))
     }
 
+    /// Clears a failed run back to active. The caller has checked, outside the lock, that the integration branch is
+    /// back on the recorded head. Errs unless the run is failed.
+    pub fn resume_run(&mut self, run_id: &str) -> AmmResult<Run> {
+        let run = self.run(run_id)?;
+        if run.state != RunState::Failed {
+            return err(format!("run {run_id} is {}, not failed", run_state_name(run.state)));
+        }
+        let next = Run { state: RunState::Active, ..run };
+        self.store.put(&next)?;
+        self.event("run_resumed", Some(run_id), None, serde_json::json!({ "head": next.integration_head }))?;
+        Ok(next)
+    }
+
     /// Cancels one brief, or every unfinished brief of a run when given a run id.
     pub fn cancel(&mut self, target: &str) -> AmmResult<()> {
         let run = self.store.get::<Run>(target);

@@ -49,3 +49,7 @@ A worker's Bash can read ~/.amm and call the daemon API as the same OS user; amm
 Don't commit to the base branch during a run. A worker's base is the merge base of its worktree with the integration head amm recorded, never a live branch, so commits that reach the base branch after the run started count as the worker's own changes and fail the done gate.
 
 A worker running as the same OS user could edit ~/.amm/amm.db, and the daemon trusts that database when it starts.
+
+amm merges only onto the commit it last recorded for `amm/<run>`. If anything else moves that branch or its worktree (a worker, a test command, a commit by hand), integration stops and the run is marked failed. Put the branch back on the recorded commit (`git reset --hard <sha>` in `.claude/worktrees/amm-<run>`), then call `amm_resume`.
+
+The integration worktree needs git 2.40 or newer (`--attr-source`), and amm refuses a non-empty `.git/info/attributes`.
