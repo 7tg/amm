@@ -10,15 +10,15 @@ pub struct PlanTask {
 
 // `[^\n\r  ]` stands in for JS `.`, which stops at any line terminator.
 static TASK_HEADING: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^(#{2,4})\s+Task\s+\d+\s*[:.\-–—]?\s*([^\n\r\u{2028}\u{2029}]*)$").unwrap());
-static ANY_HEADING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})\s").unwrap());
+    LazyLock::new(|| Regex::new(r"^(#{2,4})[ \t]+[Tt][Aa][Ss][Kk][ \t]+[0-9]+[ \t]*[:.\-–—]?[ \t]*([^\n\r\u{2028}\u{2029}]*)$").unwrap());
+static ANY_HEADING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})[ \t]").unwrap());
 static FILE_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^\s*[-*]\s*(?:Create|Modify|Test|Update|Delete):\s*([^\n\r\u{2028}\u{2029}]*)$").unwrap()
+    Regex::new(r"^[ \t]*[-*][ \t]*(?:[Cc][Rr][Ee][Aa][Tt][Ee]|[Mm][Oo][Dd][Ii][Ff][Yy]|[Tt][Ee][Ss][Tt]|[Uu][Pp][Dd][Aa][Tt][Ee]|[Dd][Ee][Ll][Ee][Tt][Ee]):[ \t]*([^\n\r\u{2028}\u{2029}]*)$").unwrap()
 });
-static FENCE_OPEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(`{3,}|~{3,})").unwrap());
-static FENCE_CLOSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(`{3,}|~{3,})\s*$").unwrap());
+static FENCE_OPEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[ \t]*(`{3,}|~{3,})").unwrap());
+static FENCE_CLOSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[ \t]*(`{3,}|~{3,})[ \t]*$").unwrap());
 static TICKED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`]+)`").unwrap());
-static LINE_RANGE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":\d+(-\d+)?$").unwrap());
+static LINE_RANGE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":[0-9]+(-[0-9]+)?$").unwrap());
 
 /// Splits a plan written as "### Task N: Title" sections (superpowers format) into tasks.
 pub fn parse_plan(md: &str) -> Vec<PlanTask> {
@@ -136,6 +136,11 @@ body
         let tasks = parse_plan(md);
         assert_eq!(titles(&tasks), vec!["X"]);
         assert_eq!(tasks[0].files, vec!["yes.ts"]);
+    }
+
+    #[test]
+    fn non_ascii_digits_do_not_make_a_task() {
+        assert!(parse_plan("### Task \u{661}: X\n").is_empty());
     }
 
     #[test]
