@@ -2,20 +2,21 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { DEFAULT_LIMITS } from '../src/config.ts';
 import { Amm } from '../src/service.ts';
-import { initRepo, makeAmm } from './helpers.ts';
+import { addWorktree, initRepo, makeAmm } from './helpers.ts';
 
 async function started(limits = {}) {
   const h = makeAmm(limits);
-  const run = await h.amm.startRun({ repo: '/repo', testCmd: 'npm test', baseBranch: 'main' });
+  const repo = initRepo();
+  const run = await h.amm.startRun({ repo, testCmd: 'npm test', baseBranch: 'main' });
   const b = h.amm.addBrief(run.id, { title: 't', goal: 'g', scope: ['src/**'], checks: ['x'], tier: 'light' });
   h.amm.dispatch(run.id);
-  return { ...h, run, b };
+  return { ...h, run, b, repo };
 }
 
 test('cancel while checking: stopBlocked and complete are no-ops', async () => {
-  const { amm, b } = await started();
-  const repo = initRepo();
-  await amm.bind(b.id, 'a1', repo);
+  const { amm, b, repo } = await started();
+  const wt = addWorktree(repo);
+  await amm.bind(b.id, 'a1', wt);
   const w = amm.workerForBrief(b.id)!;
   assert.ok(amm.markChecking(w, null));
   amm.cancel(b.id);
@@ -26,11 +27,11 @@ test('cancel while checking: stopBlocked and complete are no-ops', async () => {
 });
 
 test('sweep while checking, then complete is a no-op', async () => {
-  const { amm, clock, b } = await started({ leaseMs: 1000 });
-  await amm.bind(b.id, 'a1', initRepo());
+  const { amm, clock, b, repo } = await started({ leaseMs: 1000 });
+  await amm.bind(b.id, 'a1', addWorktree(repo));
   const w = amm.workerForBrief(b.id)!;
   amm.markChecking(w, null);
-  clock.advance(1000 + DEFAULT_LIMITS.checkTimeoutMs + 1);
+  clock.advance(1000 + DEFAULT_LIMITS.gateBudgetMs + 1);
   amm.sweep();
   assert.equal(amm.complete(w), false);
   assert.equal(amm.escalate(w, 'x'), false);
@@ -60,10 +61,9 @@ test('status() without a run id does not advance cursors', async () => {
 });
 
 test('concurrent binds bind exactly one agent', async () => {
-  const { amm, b } = await started();
-  const repo = initRepo();
-  const rs = await Promise.all([amm.bind(b.id, 'a1', repo), amm.bind(b.id, 'a2', repo)]);
-  assert.equal(rs.filter(Boolean).length, 1);
+  const { amm, b, repo } = await started();
+  const rs = await Promise.all([amm.bind(b.id, 'a1', addWorktree(repo)), amm.bind(b.id, 'a2', addWorktree(repo))]);
+  assert.equal(rs.filter((r) => 'worker' in r).length, 1);
   const w = amm.workerForBrief(b.id)!;
   assert.match(w.baseSha!, /^[0-9a-f]{40}$/);
 });

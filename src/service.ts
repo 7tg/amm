@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { agentType, type Limits, nextTier, TIER_MAX_TURNS, toolName } from './config.ts';
-import { git } from './git.ts';
+import { git, worktreeInfo } from './git.ts';
 import { parsePlan } from './plan-import.ts';
 import { scopesOverlap } from './scope.ts';
 import { Semaphores } from './semaphores.ts';
@@ -44,7 +44,7 @@ export class Amm {
     // Rebuild worker slots after a restart; leases keep their remaining time.
     for (const w of store.all('workers')) {
       if (!ACTIVE.includes(w.state)) continue;
-      const extra = w.state === 'checking' ? (this.store.get('briefs', w.briefId)?.checks.length ?? 0) * limits.checkTimeoutMs : 0;
+      const extra = w.state === 'checking' ? (this.store.get('briefs', w.briefId)?.checks.length ? limits.gateBudgetMs : 0) : 0;
       const remaining = Math.max(1, w.lastEventAt + limits.leaseMs + extra - now());
       this.sem.tryAcquire('workers', w.id, Infinity, remaining);
     }
@@ -210,6 +210,7 @@ export class Amm {
       agentId: null,
       tier: b.tier,
       worktree: null,
+      branch: null,
       baseSha: null,
       transcriptPath: null,
       state: 'starting',
@@ -301,22 +302,33 @@ export class Amm {
     return next;
   }
 
-  async bind(briefId: string, agentId: string, worktree: string): Promise<Worker | undefined> {
+  async bind(briefId: string, agentId: string, cwd: string): Promise<{ worker: Worker } | { error: string }> {
     const existing = this.workerByAgent(agentId);
-    if (existing) return existing;
+    if (existing) return { worker: existing };
     const w = this.workerForBrief(briefId);
-    if (!w || w.agentId) return undefined;
-    const claimed = this.transition(w, ['starting'], { agentId, worktree, state: 'running', lastEventAt: this.now() });
-    if (!claimed) return undefined;
+    if (!w || w.agentId) return { error: `brief ${briefId} has no unbound worker` };
+    // Claim synchronously, before any await, so concurrent binds cannot both win.
+    const claimed = this.transition(w, ['starting'], { agentId, worktree: cwd, state: 'running', lastEventAt: this.now() });
+    if (!claimed) return { error: `brief ${briefId} has no unbound worker` };
     this.sem.tryAcquire('workers', w.id, Infinity, this.limits.leaseMs);
-    this.event('bind', w.runId, w.id, { briefId, agentId, worktree });
-    let sha: string | null = null;
+    const refuse = (error: string) => {
+      this.putWorker(w, { agentId: null, worktree: null, state: 'starting' });
+      this.event('bind_refused', w.runId, w.id, { briefId, agentId, cwd, error });
+      return { error };
+    };
     try {
-      sha = (await git(worktree, ['rev-parse', 'HEAD'])).stdout.trim() || null;
-    } catch {
-      sha = null;
+      const repo = await worktreeInfo(this.run(w.runId).repo);
+      const info = await worktreeInfo(cwd);
+      if (info.toplevel === repo.toplevel) return refuse('this is the main checkout, not a worktree');
+      if (info.commonDir !== repo.commonDir) return refuse('this worktree belongs to a different repository');
+      if (!info.branch?.startsWith('worktree-agent-')) return refuse(`branch ${info.branch ?? '(detached)'} is not a worktree-agent-* branch`);
+      const mb = await git(info.toplevel, ['merge-base', 'HEAD', repo.head]);
+      if (mb.code !== 0 || !mb.stdout.trim()) return refuse('could not determine the base commit');
+      this.event('bind', w.runId, w.id, { briefId, agentId, worktree: info.toplevel });
+      return { worker: this.putWorker(w, { worktree: info.toplevel, branch: info.branch, baseSha: mb.stdout.trim() }) };
+    } catch (e) {
+      return refuse((e as Error).message.split('\n')[0]);
     }
-    return this.putWorker(w, { baseSha: sha });
   }
 
   touchWorker(w: Worker): Worker {
@@ -346,7 +358,7 @@ export class Amm {
     const next = this.transition(w, ['running'], { state: 'checking', transcriptPath: transcriptPath ?? this.fresh(w).transcriptPath });
     if (!next) return null;
     const checks = this.brief(w.briefId).checks.length;
-    this.sem.tryAcquire('workers', w.id, Infinity, this.limits.leaseMs + checks * this.limits.checkTimeoutMs);
+    this.sem.tryAcquire('workers', w.id, Infinity, this.limits.leaseMs + (checks ? this.limits.gateBudgetMs : 0));
     return next;
   }
 

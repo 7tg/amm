@@ -44,6 +44,7 @@ export interface Worker {
   agentId: string | null;
   tier: Tier;
   worktree: string | null;
+  branch: string | null;
   baseSha: string | null;
   transcriptPath: string | null;
   state: WorkerState;

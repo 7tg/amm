@@ -14,6 +14,8 @@ export interface Limits {
   maxStopBlocks: number;
   leaseMs: number;
   checkTimeoutMs: number;
+  /** Overall time one done gate may spend running checks. */
+  gateBudgetMs: number;
   idleShutdownMs: number;
 }
 
@@ -25,6 +27,7 @@ export const DEFAULT_LIMITS: Limits = {
   maxStopBlocks: 3,
   leaseMs: 10 * 60_000,
   checkTimeoutMs: 5 * 60_000,
+  gateBudgetMs: 540_000,
   idleShutdownMs: 30 * 60_000,
 };
 

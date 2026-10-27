@@ -3,19 +3,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { handleHook, type HookInput } from '../src/hooks.ts';
-import { initRepo, makeAmm } from './helpers.ts';
+import { addWorktree, initRepo, makeAmm } from './helpers.ts';
 
 async function boundWorker(checks: string[] = []) {
   const h = makeAmm();
-  const repo = initRepo({ 'src/a.ts': 'a\n', 'README.md': 'r\n' });
-  const run = await h.amm.startRun({ repo, testCmd: 'true', baseBranch: 'main' });
+  const main = initRepo({ 'src/a.ts': 'a\n', 'README.md': 'r\n' });
+  const repo = addWorktree(main);
+  const run = await h.amm.startRun({ repo: main, testCmd: 'true', baseBranch: 'main' });
   const b = h.amm.addBrief(run.id, { title: 't', goal: 'g', scope: ['src/**'], checks, tier: 'light' });
   h.amm.dispatch(run.id);
   const base = { session_id: 's', cwd: repo, agent_id: 'ag1', agent_type: 'amm:amm-worker-light' };
   const hook = (event: string, extra: Partial<HookInput>) =>
     handleHook(h.amm, event, { ...base, hook_event_name: event, ...extra } as HookInput);
   await hook('PreToolUse', { tool_name: 'mcp__plugin_amm_amm__amm_brief_get', tool_input: { token: b.id } });
-  return { ...h, repo, run, b, hook };
+  return { ...h, main, repo, run, b, hook };
 }
 
 const denyReason = (out: Record<string, unknown>) =>
