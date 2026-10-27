@@ -1,12 +1,12 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { agentType, type Limits, TIER_MAX_TURNS, toolName } from './config.ts';
+import { agentType, type Limits, nextTier, TIER_MAX_TURNS, toolName } from './config.ts';
 import { git } from './git.ts';
 import { parsePlan } from './plan-import.ts';
 import { scopesOverlap } from './scope.ts';
 import { Semaphores } from './semaphores.ts';
 import type { Store } from './store.ts';
-import type { AmmEvent, Brief, Run, Tier, Worker, WorkerState } from './types.ts';
+import type { AmmEvent, Brief, Report, Run, Session, Tier, Worker, WorkerState } from './types.ts';
 
 const newId = (prefix: string) => prefix + crypto.randomBytes(3).toString('hex');
 export const ACTIVE: WorkerState[] = ['starting', 'running', 'checking'];
@@ -249,6 +249,141 @@ export class Amm {
       }
     }
     return out.join('\n') || 'no active runs';
+  }
+  /** Re-reads a worker so callers never write back a stale copy. */
+  private fresh(w: Worker): Worker {
+    return this.store.get('workers', w.id)!;
+  }
+
+  private putWorker(w: Worker, patch: Partial<Worker>): Worker {
+    const next = { ...this.fresh(w), ...patch };
+    this.store.put('workers', next);
+    return next;
+  }
+
+  async bind(briefId: string, agentId: string, worktree: string): Promise<Worker | undefined> {
+    const existing = this.workerByAgent(agentId);
+    if (existing) return existing;
+    const w = this.workerForBrief(briefId);
+    if (!w || w.agentId) return undefined;
+    const sha = (await git(worktree, ['rev-parse', 'HEAD'])).stdout.trim() || null;
+    const bound = this.putWorker(w, { agentId, worktree, baseSha: sha, state: 'running', lastEventAt: this.now() });
+    this.sem.renew(w.id, this.limits.leaseMs);
+    this.event('bind', w.runId, w.id, { briefId, agentId, worktree });
+    return bound;
+  }
+
+  touchWorker(w: Worker): Worker {
+    this.sem.renew(w.id, this.limits.leaseMs);
+    return this.putWorker(w, { lastEventAt: this.now() });
+  }
+
+  updateCounters(w: Worker, c: Pick<Worker, 'toolCalls' | 'sinceProgress' | 'lastCmd' | 'lastCmdFails' | 'firedRules'>): Worker {
+    return this.putWorker(w, {
+      toolCalls: c.toolCalls,
+      sinceProgress: c.sinceProgress,
+      lastCmd: c.lastCmd,
+      lastCmdFails: c.lastCmdFails,
+      firedRules: c.firedRules,
+    });
+  }
+
+  takeCorrection(w: Worker): string | null {
+    const msg = this.fresh(w).pendingCorrection;
+    if (!msg) return null;
+    this.putWorker(w, { pendingCorrection: null });
+    this.event('correction', w.runId, w.id, { rule: 'manager', message: msg, via: 'deny' });
+    return msg;
+  }
+
+  markChecking(w: Worker, transcriptPath: string | null): Worker {
+    const checks = this.brief(w.briefId).checks.length;
+    this.sem.renew(w.id, this.limits.leaseMs + checks * this.limits.checkTimeoutMs);
+    return this.putWorker(w, { state: 'checking', transcriptPath: transcriptPath ?? this.fresh(w).transcriptPath });
+  }
+
+  stopBlocked(w: Worker, problems: string[]): Worker {
+    const next = this.putWorker(w, { state: 'running', stopBlocks: this.fresh(w).stopBlocks + 1 });
+    this.event('gate_fail', w.runId, w.id, { briefId: w.briefId, problems });
+    return next;
+  }
+
+  report(briefId: string, r: Report): void {
+    const b = this.brief(briefId);
+    this.store.put('briefs', { ...b, report: r });
+    this.event('report', b.runId, this.workerForBrief(b.id)?.id ?? null, { briefId, status: r.status, files: r.files, notes: r.notes });
+  }
+
+  private endWorker(w: Worker, state: WorkerState): Worker {
+    this.sem.release(w.id);
+    return this.putWorker(w, { state });
+  }
+
+  complete(w: Worker): void {
+    this.endWorker(w, 'done');
+    const b = this.brief(w.briefId);
+    this.store.put('briefs', { ...b, state: 'done' });
+    this.event('done', b.runId, w.id, { briefId: b.id, title: b.title });
+  }
+
+  markBlocked(w: Worker): void {
+    this.endWorker(w, 'blocked');
+    const b = this.brief(w.briefId);
+    this.store.put('briefs', { ...b, state: 'blocked' });
+    this.event('blocked', b.runId, w.id, { briefId: b.id, notes: b.report?.notes ?? '' });
+  }
+
+  escalate(w: Worker, reason: string): void {
+    this.endWorker(w, 'escalated');
+    const b = this.brief(w.briefId);
+    const tier = nextTier(b.tier);
+    const notes = [...b.notes, `attempt ${b.attempt} (${b.tier}) was stopped: ${reason}`];
+    if (tier) {
+      this.store.put('briefs', { ...b, tier, maxTurns: TIER_MAX_TURNS[tier], attempt: b.attempt + 1, notes, report: null, state: 'queued' });
+      this.event('escalate', b.runId, w.id, { briefId: b.id, from: b.tier, to: tier, reason });
+    } else {
+      this.store.put('briefs', { ...b, notes, state: 'failed' });
+      this.event('failed', b.runId, w.id, { briefId: b.id, reason });
+    }
+  }
+
+  nudge(briefId: string, message: string): void {
+    const w = this.workerForBrief(briefId);
+    if (!w) throw new Error(`brief ${briefId} has no active worker`);
+    this.putWorker(w, { pendingCorrection: `amm (from your manager): ${message}` });
+    this.event('nudge', w.runId, w.id, { briefId, message });
+  }
+
+  /** Cancels one brief, or every unfinished brief of a run when given a run id. */
+  cancel(target: string): void {
+    const isRun = this.store.get('runs', target) !== undefined;
+    const briefs = isRun ? this.store.all('briefs').filter((b) => b.runId === target) : [this.brief(target)];
+    if (isRun) this.store.put('runs', { ...this.run(target), state: 'cancelled' });
+    for (const b of briefs) {
+      if (b.state === 'done' || b.state === 'cancelled') continue;
+      const w = this.workerForBrief(b.id);
+      if (w) this.endWorker(w, 'cancelled');
+      this.store.put('briefs', { ...this.brief(b.id), state: 'cancelled' });
+      this.event('cancel', b.runId, w?.id ?? null, { briefId: b.id });
+    }
+  }
+
+  /** Marks workers whose lease expired as lost and requeues their briefs. */
+  sweep(): void {
+    for (const id of this.sem.expire()) {
+      const w = this.store.get('workers', id);
+      if (!w || !ACTIVE.includes(w.state)) continue;
+      this.putWorker(w, { state: 'lost' });
+      const b = this.brief(w.briefId);
+      if (b.state === 'running') this.store.put('briefs', { ...b, state: 'queued' });
+      this.event('lost', w.runId, w.id, { briefId: w.briefId });
+    }
+  }
+
+  touchSession(id: string, cwd: string): void {
+    const s = this.store.get('sessions', id);
+    const next: Session = s ? { ...s, lastSeen: this.now() } : { id, cwd, firstSeen: this.now(), lastSeen: this.now() };
+    this.store.put('sessions', next);
   }
 }
 
