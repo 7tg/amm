@@ -10,19 +10,26 @@ agents (Haiku / Sonnet / Opus) do the work in isolated git worktrees; amm superv
 
 One daemon per machine (`~/.amm`, `127.0.0.1:7878`) holds all state in SQLite.
 
-## Install (local)
+## Install
 
-```bash
-claude --plugin-dir /path/to/amm
+In Claude Code:
+
+```
+/plugin marketplace add 7tg/amm
+/plugin install amm@amm
 ```
 
-amm is one Rust binary, `amm` (`daemon` | `shim` | `hook <Event>`). The plugin runs it through
-`bin/amm`, a small sh launcher. On first use, and after a version bump, the launcher fetches the
-release binary for your platform (Linux or macOS, x86_64 or arm64) into `bin/<target>/` with
-`gh release download`. The repo is private, so this needs `gh auth login`. Without `gh`, or
-without a matching release, it builds the binary with `cargo build --release` instead (Rust 1.88+) and installs it under
-`bin/<host triple>/`. Only `shim`, `daemon` and `--version` install; a hook never downloads, builds
-or waits, and while the binary is missing it fails open, so it never blocks the agent.
+or from a shell: `claude plugin marketplace add 7tg/amm && claude plugin install amm@amm`.
+To try a local checkout instead: `claude --plugin-dir /path/to/amm`.
+
+amm is one Rust binary, `amm` (`daemon` | `shim` | `hook <Event>` | `dashboard`). The plugin runs
+it through `bin/amm`, a small sh launcher. On first use, and after a version bump, the launcher
+downloads the release binary for your platform (Linux or macOS, x86_64 or arm64) into
+`bin/<target>/`, with `gh`, `curl` or `wget`. Without any of them, or without a matching release,
+it builds the binary with `cargo build --release` instead (Rust 1.88+) and installs it under
+`bin/<host triple>/`. Only `shim`, `daemon`, `dashboard` and `--version` install; a hook never
+downloads, builds or waits, and while the binary is missing it fails open, so it never blocks the
+agent.
 
 ## Use
 
@@ -32,7 +39,7 @@ Ask the main session to delegate a goal or a plan file ("delegate this plan with
 ## Dashboard
 
 The daemon also serves a read-only dashboard: runs, briefs as a board, each worker's events,
-and token and cost totals for workers and manager sessions. Run
+and token and cost totals for workers and manager sessions. Ask for it with `/amm:dashboard`, or run
 
 ```bash
 amm dashboard

@@ -39,17 +39,25 @@ find_bin() {
 # Every output goes to stderr: for `shim`, stdout is the MCP channel.
 install() {
   dir="$ROOT/bin/$TARGET"
-  if command -v gh >/dev/null 2>&1; then
+  asset="amm-$TARGET.tar.gz"
+  url="https://github.com/7tg/amm/releases/download/v$VERSION/$asset"
+  # Tries gh, curl, then wget; each writes the archive to stdout.
+  for fetch in gh curl wget; do
+    command -v "$fetch" >/dev/null 2>&1 || continue
     tmp="$ROOT/bin/.download.$$"
     rm -rf "$tmp"
-    if mkdir "$tmp" &&
-      gh release download "v$VERSION" -R 7tg/amm -p "amm-$TARGET.tar.gz" -O - 2>/dev/null | tar -xz -C "$tmp" 2>/dev/null &&
+    case $fetch in
+      gh) get() { gh release download "v$VERSION" -R 7tg/amm -p "$asset" -O - 2>/dev/null; } ;;
+      curl) get() { curl -fsSL --connect-timeout 10 --max-time 120 "$url" 2>/dev/null; } ;;
+      wget) get() { wget -q -T 60 -O - "$url" 2>/dev/null; } ;;
+    esac
+    if mkdir "$tmp" && get | tar -xz -C "$tmp" 2>/dev/null &&
       [ -f "$tmp/amm" ] && chmod 755 "$tmp/amm" && mkdir -p "$dir" && mv -f "$tmp/amm" "$dir/amm"; then
       rm -rf "$tmp"
       find_bin && return 0
     fi
     rm -rf "$tmp"
-  fi
+  done
   if command -v cargo >/dev/null 2>&1; then
     host=$(rustc -vV 2>/dev/null | sed -n 's/host: //p')
     [ -n "$host" ] || host=$HOST_GUESS
@@ -83,7 +91,7 @@ if ! find_bin; then
   find_bin || install
   rm -rf "$LOCK"
   trap - EXIT HUP INT TERM
-  find_bin || fail "cannot get the amm v$VERSION binary for $TARGET: no release download (gh) and no cargo"
+  find_bin || fail "cannot get the amm v$VERSION binary for $TARGET: no release download (gh, curl or wget) and no cargo"
 fi
 
 exec "$BIN" "$@"

@@ -124,7 +124,7 @@ fn write_exe(path: &Path, script: &str) {
 /// A PATH holding only the tools the launcher needs, so neither gh, cargo nor rustc can be found.
 fn bare_path() -> PathBuf {
     let dir = common::tmp_dir();
-    for tool in ["sh", "uname", "sed", "head", "mkdir", "rm", "dirname", "cat", "sleep", "chmod", "cp", "mv", "tar"] {
+    for tool in ["sh", "uname", "sed", "head", "mkdir", "rm", "dirname", "cat", "sleep", "chmod", "cp", "mv", "tar", "gzip"] {
         std::os::unix::fs::symlink(which(tool).unwrap_or_else(|| panic!("{tool} not on PATH")), dir.join(tool)).unwrap();
     }
     dir
@@ -258,5 +258,31 @@ fn launcher_cargo_fallback_installs_under_the_host_triple() {
         // A hook finds that build without rustc or cargo.
         let r = launch(&sh, &plugin, &["hook", "PreToolUse"]);
         assert_eq!(String::from_utf8_lossy(&r.stdout), "ran: hook PreToolUse\n", "{sh:?}");
+    }
+}
+
+#[test]
+fn launcher_downloads_the_release_with_curl_when_gh_is_missing() {
+    let version = env!("CARGO_PKG_VERSION");
+    let staging = common::tmp_dir();
+    write_exe(&staging.join("amm"), &fake_script(version));
+    let tarball = staging.join("release.tar.gz");
+    let ok = Command::new("tar").arg("-czf").arg(&tarball).arg("-C").arg(&staging).arg("amm").status().unwrap();
+    assert!(ok.success());
+    let url = format!("https://github.com/7tg/amm/releases/download/v{version}/amm-{}.tar.gz", target());
+    for sh in shells() {
+        let plugin = plugin_copy();
+        let path = bare_path();
+        // Serves the archive only for the expected release URL, like a 404 otherwise.
+        let curl = format!(
+            "#!/bin/sh\nfor a; do [ \"$a\" = '{url}' ] && exec cat '{}'; done\nexit 22\n",
+            tarball.display()
+        );
+        write_exe(&path.join("curl"), &curl);
+
+        let r = launch_with(&sh, &plugin, &path, &["--version"]);
+        assert_eq!(r.status.code(), Some(0), "{sh:?} {}", String::from_utf8_lossy(&r.stderr));
+        assert_eq!(String::from_utf8_lossy(&r.stdout), format!("amm {version}\n"), "{sh:?}");
+        assert!(plugin.join("bin").join(target()).join("amm").is_file(), "{sh:?}");
     }
 }
