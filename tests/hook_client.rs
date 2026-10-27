@@ -147,3 +147,19 @@ fn hook_without_a_lock_exits_in_under_20ms() {
     times.sort();
     assert!(times[2] < Duration::from_millis(20), "median {:?} of {times:?}", times[2]);
 }
+
+/// Exit code 2 from a PreToolUse hook blocks the tool call, so bad arguments must not produce it.
+#[test]
+fn bad_hook_arguments_exit_zero() {
+    for args in [&["hook", "PreToolUse", "extra"][..], &["hook", "--bogus"][..]] {
+        let r = Command::new(AMM).args(args).env("AMM_HOME", common::tmp_dir()).stdin(Stdio::null()).output().unwrap();
+        assert_eq!(r.status.code(), Some(0), "{args:?}");
+        assert!(r.stdout.is_empty(), "{args:?}");
+    }
+}
+
+#[test]
+fn bad_arguments_elsewhere_still_fail() {
+    let r = Command::new(AMM).arg("--bogus").output().unwrap();
+    assert_eq!(r.status.code(), Some(2));
+}

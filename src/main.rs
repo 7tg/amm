@@ -20,7 +20,12 @@ enum Command {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // A hook must never fail on bad arguments: exit code 2 from PreToolUse would block the tool call.
+        Err(_) if std::env::args().nth(1).as_deref() == Some("hook") => std::process::exit(0),
+        Err(e) => e.exit(),
+    };
     match cli.command {
         Command::Daemon => std::process::exit(daemon()),
         Command::Shim => std::process::exit(shim()),

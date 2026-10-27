@@ -12,9 +12,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const DEFAULT_TOOL_PREFIX: &str = "mcp__plugin_amm_";
 const MAX_BODY: u64 = 10 * 1024 * 1024;
 
-/// Runs the client and returns the process exit code, which is always 0.
+/// Runs the client and returns the process exit code, which is always 0, even after a panic.
 pub fn run_hook(event: Option<&str>) -> i32 {
-    let Some(event) = event.filter(|e| !e.is_empty()) else { return 0 };
+    let _ = std::panic::catch_unwind(|| forward(event));
+    0
+}
+
+fn forward(event: Option<&str>) {
+    let Some(event) = event.filter(|e| !e.is_empty()) else { return };
     let env: Env = std::env::vars().collect();
     let home = amm_home(&env);
 
@@ -22,15 +27,15 @@ pub fn run_hook(event: Option<&str>) -> i32 {
     let _ = std::io::stdin().read_to_end(&mut raw);
 
     // amm is not running on this machine.
-    let Some(lock) = read_lock(&home) else { return 0 };
+    let Some(lock) = read_lock(&home) else { return };
     // Never send the token to whoever now holds a dead daemon's port.
     if !pid_alive(lock.pid) {
-        return 0;
+        return;
     }
-    let Ok(input) = serde_json::from_slice::<Value>(&raw) else { return 0 };
+    let Ok(input) = serde_json::from_slice::<Value>(&raw) else { return };
     let prefix = env.get("AMM_TOOL_PREFIX").map_or(DEFAULT_TOOL_PREFIX, String::as_str);
     if !relevant(event, &input, prefix) {
-        return 0;
+        return;
     }
 
     match post(&lock, event, &raw) {
@@ -47,7 +52,6 @@ pub fn run_hook(event: Option<&str>) -> i32 {
         }
         Err(e) => fallback_log(&home, &format!("{event} {e}")),
     }
-    0
 }
 
 /// Only worker events, subagent lifecycle, and the main session's amm tool calls matter.

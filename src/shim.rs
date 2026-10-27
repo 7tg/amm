@@ -46,8 +46,14 @@ fn spawn_daemon(home: &Path, log_path: &Path) -> std::io::Result<()> {
         cmd.arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
-            .process_group(0);
+            .stderr(Stdio::from(log));
+        // SAFETY: setsid is async-signal-safe; it detaches the daemon from the shim's session and terminal.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
         cmd.spawn()?
     };
     // Reap it if it exits while the shim is still running, so it does not linger as a zombie.
