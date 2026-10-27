@@ -175,9 +175,9 @@ async function subagentStop(amm: Amm, input: HookInput): Promise<HookOutput> {
   }
   const checking = amm.markChecking(w, input.agent_transcript_path ?? null);
   if (!checking) return allow();
-  const problems = await gateProblems(amm, checking, b);
+  const { problems, gatedSha } = await gateProblems(amm, checking, b);
   if (problems.length === 0) {
-    amm.complete(checking);
+    amm.complete(checking, gatedSha);
     return allow();
   }
   // null: the worker was cancelled or swept while its checks ran; let it stop.
@@ -190,7 +190,7 @@ async function subagentStop(amm: Amm, input: HookInput): Promise<HookOutput> {
   return blockStop(`amm done gate failed:\n- ${problems.join('\n- ')}\nFix these, then finish again.`);
 }
 
-async function gateProblems(amm: Amm, w: Worker, b: Brief): Promise<string[]> {
+async function gateProblems(amm: Amm, w: Worker, b: Brief): Promise<{ problems: string[]; gatedSha: string | null }> {
   const problems: string[] = [];
   if (!b.report) problems.push(`you have not called ${toolName('amm_report')} with token "${b.id}"`);
   const repoDir = amm.run(w.runId).repo;
@@ -220,8 +220,11 @@ async function gateProblems(amm: Amm, w: Worker, b: Brief): Promise<string[]> {
   // Checks run worker-written code, which may have tampered with the worktree: verify again, then diff.
   const after = before ? null : await verify();
   if (after) problems.push(`after the checks: ${after}`);
+  let gatedSha: string | null = null;
   if (!before && !after) {
     try {
+      gatedSha = (await git(w.worktree!, ['rev-parse', '--verify', `refs/heads/${w.branch}`])).stdout.trim() || null;
+      if (!gatedSha) problems.push('amm could not read your branch head');
       const outside = (await changedFiles(w.worktree!, w.baseSha!, w.branch!)).filter((f) => !inScope(path.join(w.worktree!, f), w.worktree!, b.scope));
       if (outside.length) {
         problems.push(`files changed outside your scope: ${outside.join(', ')}. Revert them and describe the needed change in amm_report instead`);
@@ -231,5 +234,5 @@ async function gateProblems(amm: Amm, w: Worker, b: Brief): Promise<string[]> {
       problems.push(`amm could not list your changed files: ${(e as Error).message.split('\n')[0]}`);
     }
   }
-  return problems;
+  return { problems, gatedSha };
 }

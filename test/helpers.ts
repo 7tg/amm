@@ -28,6 +28,7 @@ export function initRepo(files: Record<string, string> = { 'README.md': 'hi\n' }
   const dir = tmpDir();
   const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
   git('init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(dir, '.gitignore'), '.claude/\n');
   for (const [name, content] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
     fs.writeFileSync(path.join(dir, name), content);

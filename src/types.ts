@@ -45,6 +45,8 @@ export interface Worker {
   tier: Tier;
   worktree: string | null;
   branch: string | null;
+  /** Branch head the done gate verified; the merge queue merges this sha, never the branch name. */
+  gatedSha: string | null;
   baseSha: string | null;
   transcriptPath: string | null;
   state: WorkerState;

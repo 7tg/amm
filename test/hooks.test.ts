@@ -172,14 +172,17 @@ test('files touched by the done checks count toward the scope check', async () =
   assert.match(String((await hook('SubagentStop', {})).reason), /outside your scope: README.md/);
 });
 
-for (const sabotage of ['rm .git', 'git checkout -q --detach HEAD~0']) {
-  test(`a check that runs "${sabotage}" cannot hide a committed out-of-scope change`, async () => {
-    const { amm, b, hook, repo } = await boundWorker([sabotage]);
+for (const kind of ['rm .git', 'detach']) {
+  test(`a check that runs "${kind}" cannot hide a committed out-of-scope change`, async () => {
+    const { amm, b, hook, repo } = await boundWorker();
+    const baseSha = amm.workerByAgent('ag1')!.baseSha!;
+    amm.store.put('briefs', { ...amm.brief(b.id), checks: [kind === 'rm .git' ? 'rm .git' : `git checkout -q --detach ${baseSha}`] });
     fs.writeFileSync(path.join(repo, 'README.md'), 'evil\n');
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qam', 'evil'], { cwd: repo });
     amm.report(b.id, { status: 'done', files: [], notes: '' });
     const out = await hook('SubagentStop', {});
     assert.equal(out.decision, 'block');
+    assert.match(String(out.reason), /after the checks/);
     assert.notEqual(amm.brief(b.id).state, 'done');
   });
 }
@@ -204,4 +207,16 @@ test('only the exact amm_brief_get tool name is allowed before binding', async (
   const { amm, repo } = await boundWorker();
   const out = await handleHook(amm, 'PreToolUse', { session_id: 's', cwd: repo, hook_event_name: 'PreToolUse', agent_id: 'ag9', agent_type: 'amm:amm-worker-light', tool_name: 'evil__amm_brief_get', tool_input: { token: 'x' } });
   assert.match(denyReason(out)!, /fetch your brief first/);
+});
+
+test('completion records the verified branch head as gatedSha', async () => {
+  const { amm, b, hook, repo } = await boundWorker();
+  fs.writeFileSync(path.join(repo, 'src/b.ts'), 'b\n');
+  execFileSync('git', ['add', '.'], { cwd: repo });
+  execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'work'], { cwd: repo });
+  amm.report(b.id, { status: 'done', files: ['src/b.ts'], notes: '' });
+  assert.deepEqual(await hook('SubagentStop', {}), {});
+  const w = amm.workerByAgent('ag1')!;
+  assert.equal(w.state, 'done');
+  assert.equal(w.gatedSha, execFileSync('git', ['rev-parse', w.branch!], { cwd: repo }).toString().trim());
 });

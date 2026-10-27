@@ -211,6 +211,7 @@ export class Amm {
       tier: b.tier,
       worktree: null,
       branch: null,
+      gatedSha: null,
       baseSha: null,
       transcriptPath: null,
       state: 'starting',
@@ -377,16 +378,16 @@ export class Amm {
     this.event('report', b.runId, this.workerForBrief(b.id)?.id ?? null, { briefId, status: r.status, files: r.files, notes: r.notes });
   }
 
-  private endWorker(w: Worker, from: WorkerState[], state: WorkerState): boolean {
-    if (!this.transition(w, from, { state })) return false;
+  private endWorker(w: Worker, from: WorkerState[], state: WorkerState, patch: Partial<Worker> = {}): boolean {
+    if (!this.transition(w, from, { ...patch, state })) return false;
     this.sem.release(w.id);
     return true;
   }
 
-  complete(w: Worker): boolean {
+  complete(w: Worker, gatedSha: string | null = null): boolean {
     const b = this.brief(w.briefId);
     if (b.state !== 'running') return false;
-    if (!this.endWorker(w, ['checking', 'running'], 'done')) return false;
+    if (!this.endWorker(w, ['checking', 'running'], 'done', { gatedSha })) return false;
     this.store.put('briefs', { ...b, state: 'done' });
     this.event('done', b.runId, w.id, { briefId: b.id, title: b.title });
     return true;
