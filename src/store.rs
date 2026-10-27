@@ -135,6 +135,19 @@ impl Store {
     }
 
     /// Appends an event (its `id` is ignored) and returns the new id.
+    /// Writes `a` and `b` in one transaction: both land, or neither does (db and cache).
+    pub fn put_pair<A: Doc, B: Doc>(&mut self, a: &A, b: &B) -> Result<(), StoreError> {
+        let da = serde_json::to_string(a).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let db_ = serde_json::to_string(b).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let tx = self.db.transaction()?;
+        tx.execute(&format!("INSERT OR REPLACE INTO {} (id, data) VALUES (?1, ?2)", A::TABLE), params![a.doc_id(), da])?;
+        tx.execute(&format!("INSERT OR REPLACE INTO {} (id, data) VALUES (?1, ?2)", B::TABLE), params![b.doc_id(), db_])?;
+        tx.commit()?;
+        A::cache_mut(&mut self.cache).insert(a.doc_id().to_string(), a.clone());
+        B::cache_mut(&mut self.cache).insert(b.doc_id().to_string(), b.clone());
+        Ok(())
+    }
+
     pub fn add_event(&self, e: &AmmEvent) -> Result<i64, StoreError> {
         let detail = serde_json::to_string(&e.detail)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -440,6 +453,39 @@ mod tests {
         )
         .unwrap();
         assert!(s.events(&EventFilter::default()).is_err());
+    }
+
+    #[test]
+    fn put_pair_writes_both_or_neither() {
+        let file = db_file();
+        let mut s = Store::open(&file).unwrap();
+        s.put(&sess("s1", "/a", 1)).unwrap();
+        let run = Run {
+            id: "r1".into(),
+            repo: "/r".into(),
+            base_branch: "main".into(),
+            test_cmd: "t".into(),
+            session_id: None,
+            state: crate::types::RunState::Active,
+            created_at: 1,
+            status_cursor: 0,
+            integration_branch: String::new(),
+            integration_worktree: None,
+            setup_cmd: None,
+            last_test_ok: None,
+            merges: 0,
+            integration_head: None,
+        };
+        s.put_pair(&sess("s1", "/b", 2), &run).unwrap();
+        assert_eq!((s.get::<Session>("s1").unwrap().cwd.as_str(), s.get::<Run>("r1").is_some()), ("/b", true));
+        // The second write fails: the first is rolled back, in the db and in the cache.
+        s.db.execute_batch("DROP TABLE runs").unwrap();
+        assert!(s.put_pair(&sess("s1", "/c", 3), &Run { merges: 1, ..run }).is_err());
+        assert_eq!(s.get::<Session>("s1").unwrap().cwd, "/b");
+        assert_eq!(s.get::<Run>("r1").unwrap().merges, 0);
+        drop(s);
+        let reopened = Store::open(&file).unwrap();
+        assert_eq!(reopened.get::<Session>("s1").unwrap().cwd, "/b");
     }
 
     #[test]

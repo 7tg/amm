@@ -368,16 +368,16 @@ impl Amm {
         let ids = json!({ "briefId": b.id });
         match outcome {
             Outcome::Merged { new } => {
-                let Some(_) = self.brief_transition(&b.id, &[BriefState::Merging], |x| x.state = BriefState::Merged)? else {
+                let cur = self.brief(&b.id)?;
+                if cur.state != BriefState::Merging {
                     return Ok(false);
-                };
+                }
                 let run = self.run(run_id)?;
-                self.store.put(&Run {
-                    merges: run.merges + 1,
-                    last_test_ok: Some(true),
-                    integration_head: Some(new.clone()),
-                    ..run
-                })?;
+                // One transaction: a crash or failed write never leaves a merged brief without its head, or the reverse.
+                self.store.put_pair(
+                    &Brief { state: BriefState::Merged, ..cur },
+                    &Run { merges: run.merges + 1, last_test_ok: Some(true), integration_head: Some(new.clone()), ..run },
+                )?;
                 self.event("merged", Some(run_id), Some(&w.id), json!({ "briefId": b.id, "title": b.title, "sha": new }))?;
                 Ok(true)
             }
@@ -620,6 +620,7 @@ mod tests {
     }
 
     struct Q {
+        db: PathBuf,
         state: Arc<Mutex<Amm>>,
         repo: PathBuf,
         run: Run,
@@ -654,7 +655,7 @@ mod tests {
                 setup_cmd: None,
             })
             .unwrap();
-        Q { state: Arc::new(Mutex::new(amm)), repo, run, iwt }
+        Q { db: h.dir.join("amm.db"), state: Arc::new(Mutex::new(amm)), repo, run, iwt }
     }
 
     impl Q {
@@ -867,6 +868,18 @@ mod tests {
         let v = q.events("scope_violation");
         assert_eq!(v.len(), 1);
         assert!(v[0].detail["files"].to_string().contains("lib/a.ts"), "{:?}", v[0].detail);
+    }
+
+    #[tokio::test]
+    async fn a_failed_record_writes_neither_the_brief_nor_the_run() {
+        let q = queue_with("true");
+        let b = q.add("one", "a/**");
+        q.run_worker(&b, |wt| write(wt, "a/x.ts", "1\n"));
+        let head = q.fresh_run().integration_head;
+        rusqlite::Connection::open(&q.db).unwrap().execute_batch("DROP TABLE runs").unwrap();
+        q.integrate().await;
+        assert_eq!(q.brief(&b.id).state, BriefState::Merging);
+        assert_eq!((q.fresh_run().integration_head, q.fresh_run().merges), (head, 0));
     }
 
     #[test]
