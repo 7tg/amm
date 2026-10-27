@@ -55,3 +55,11 @@ test('renew does not revive an expired lease', () => {
   s.renew('w1', 100);
   assert.deepEqual(s.expire(), ['w1']);
 });
+
+test('holders lists only live leases', () => {
+  const c = clock();
+  const s = new Semaphores(c.now);
+  s.tryAcquire('workers', 'w1', 2, 100);
+  c.advance(100);
+  assert.deepEqual(s.holders('workers'), []);
+});

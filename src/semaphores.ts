@@ -27,7 +27,8 @@ export class Semaphores {
   }
 
   holders(name: string): string[] {
-    return [...(this.held.get(name)?.keys() ?? [])];
+    const now = this.now();
+    return [...(this.held.get(name) ?? [])].filter(([, until]) => until > now).map(([k]) => k);
   }
 
   /** Removes and returns every holder whose lease has run out. */
