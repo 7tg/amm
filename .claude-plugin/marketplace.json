@@ -1,0 +1,14 @@
+{
+  "name": "amm",
+  "owner": {
+    "name": "7tg"
+  },
+  "description": "amm, a Claude Code plugin that manages worker agents.",
+  "plugins": [
+    {
+      "name": "amm",
+      "source": "./",
+      "description": "Agent middle management: delegate briefs to cheaper worker agents in isolated worktrees, supervise them, and merge their work."
+    }
+  ]
+}
