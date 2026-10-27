@@ -14,23 +14,53 @@ export function runCheck(cmd: string, cwd: string, timeoutMs: number): Promise<C
   return new Promise((resolve) => {
     const child = spawn('sh', ['-c', cmd], { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     let output = '';
-    const add = (b: Buffer) => {
-      output = (output + b.toString()).slice(-OUTPUT_TAIL);
-    };
-    child.stdout.on('data', add);
-    child.stderr.on('data', add);
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
+    let exited = false;
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (r: CheckResult) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(r);
+    };
+    const killGroup = () => {
       try {
         process.kill(-child.pid!, 'SIGKILL');
       } catch {
-        // already exited
+        // already gone
       }
+    };
+    const add = (b: string) => {
+      output = (output + b).slice(-OUTPUT_TAIL);
+    };
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', add);
+    child.stderr.on('data', add);
+    child.on('error', (err) => {
+      finish({ cmd, ok: false, code: null, timedOut: false, output: err.message });
+    });
+    timer = setTimeout(() => {
+      if (!exited) timedOut = true;
+      killGroup();
     }, timeoutMs);
+    let exitCode: number | null = null;
+    const done = () => finish({ cmd, ok: exitCode === 0 && !timedOut, code: exitCode, timedOut, output });
+    child.on('exit', (code) => {
+      exited = true;
+      exitCode = code;
+      killGroup();
+      // grandchildren may hold the pipes open; give 'close' a moment, then stop waiting
+      setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        done();
+      }, 200);
+    });
     child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ cmd, ok: code === 0 && !timedOut, code, timedOut, output });
+      exitCode = code;
+      done();
     });
   });
 }
