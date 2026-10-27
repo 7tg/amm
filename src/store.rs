@@ -7,6 +7,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
+pub type StoreError = rusqlite::Error;
+
 #[derive(Debug, Clone, Default)]
 pub struct EventFilter {
     pub run_id: Option<String>,
@@ -54,13 +56,13 @@ doc!(Worker, "workers", workers);
 doc!(Session, "sessions", sessions);
 
 /// In-memory documents, written through to SQLite. Only the daemon process opens this.
-/// Reads of events hit the database; a database error there panics (the TS threw).
+/// Nothing here panics: a panic while the daemon holds its mutex would poison it.
 pub struct Store {
     db: Connection,
     cache: Cache,
 }
 
-fn load<T: Doc>(db: &Connection, cache: &mut Cache) -> rusqlite::Result<()> {
+fn load<T: Doc>(db: &Connection, cache: &mut Cache) -> Result<(), StoreError> {
     let mut stmt = db.prepare(&format!("SELECT data FROM {}", T::TABLE))?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     for row in rows {
@@ -72,7 +74,7 @@ fn load<T: Doc>(db: &Connection, cache: &mut Cache) -> rusqlite::Result<()> {
 }
 
 impl Store {
-    pub fn open(file: &Path) -> rusqlite::Result<Store> {
+    pub fn open(file: &Path) -> Result<Store, StoreError> {
         // Create the file private from the start; the db holds briefs and transcripts' paths.
         if !file.exists() {
             let _ = std::fs::OpenOptions::new()
@@ -118,7 +120,7 @@ impl Store {
     }
 
     /// Writes to the database first; the cache only changes if that succeeded.
-    pub fn put<T: Doc>(&mut self, doc: &T) -> rusqlite::Result<()> {
+    pub fn put<T: Doc>(&mut self, doc: &T) -> Result<(), StoreError> {
         let data = serde_json::to_string(doc)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         self.db
@@ -132,7 +134,7 @@ impl Store {
     }
 
     /// Appends an event (its `id` is ignored) and returns the new id.
-    pub fn add_event(&self, e: &AmmEvent) -> rusqlite::Result<i64> {
+    pub fn add_event(&self, e: &AmmEvent) -> Result<i64, StoreError> {
         let detail = serde_json::to_string(&e.detail)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         self.db.execute(
@@ -142,11 +144,7 @@ impl Store {
         Ok(self.db.last_insert_rowid())
     }
 
-    pub fn events(&self, f: &EventFilter) -> Vec<AmmEvent> {
-        self.try_events(f).expect("events query")
-    }
-
-    fn try_events(&self, f: &EventFilter) -> rusqlite::Result<Vec<AmmEvent>> {
+    pub fn events(&self, f: &EventFilter) -> Result<Vec<AmmEvent>, StoreError> {
         let mut sql = String::from(
             "SELECT id, ts, run_id, worker_id, kind, detail FROM events WHERE id > ? AND (? IS NULL OR run_id = ?) AND (? IS NULL OR worker_id = ?)",
         );
@@ -185,15 +183,14 @@ impl Store {
         rows.collect()
     }
 
-    pub fn last_event_id(&self, run_id: &str) -> i64 {
-        self.db
+    pub fn last_event_id(&self, run_id: &str) -> Result<i64, StoreError> {
+        Ok(self.db
             .query_row(
                 "SELECT MAX(id) FROM events WHERE run_id = ?1",
                 [run_id],
                 |r| r.get::<_, Option<i64>>(0),
-            )
-            .expect("last_event_id query")
-            .unwrap_or(0)
+            )?
+            .unwrap_or(0))
     }
 }
 
@@ -272,12 +269,14 @@ mod tests {
         let by_run = s.events(&EventFilter {
             run_id: Some("r1".into()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert_eq!(by_run.iter().map(|e| e.ts).collect::<Vec<_>>(), [1, 3]);
         let by_worker = s.events(&EventFilter {
             worker_id: Some("w1".into()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert_eq!(
             serde_json::Value::Object(by_worker[0].detail.clone()),
             serde_json::json!({"n": 1})
@@ -286,7 +285,8 @@ mod tests {
             run_id: Some("r1".into()),
             after_id: Some(a),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert_eq!(
             after.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
             ["done"]
@@ -320,6 +320,7 @@ mod tests {
                 limit: Some(2),
                 ..Default::default()
             })
+            .unwrap()
             .len(),
             2
         );
@@ -328,6 +329,7 @@ mod tests {
                 limit: Some(0),
                 ..Default::default()
             })
+            .unwrap()
             .len(),
             1
         );
@@ -336,10 +338,11 @@ mod tests {
                 limit: Some(-5),
                 ..Default::default()
             })
+            .unwrap()
             .len(),
             1
         );
-        assert_eq!(s.events(&EventFilter::default()).len(), 5);
+        assert_eq!(s.events(&EventFilter::default()).unwrap().len(), 5);
     }
 
     #[test]
@@ -372,17 +375,18 @@ mod tests {
                 kinds: Some(k.iter().map(|s| s.to_string()).collect()),
                 ..Default::default()
             };
-            s.events(&f).iter().map(|e| e.ts).collect::<Vec<_>>()
+            s.events(&f).unwrap().iter().map(|e| e.ts).collect::<Vec<_>>()
         };
         assert_eq!(kinds(&["a", "c"]), [1, 3, 4]);
         assert!(kinds(&[]).is_empty());
-        assert_eq!(s.last_event_id("r"), last);
-        assert_eq!(s.last_event_id("nope"), 0);
+        assert_eq!(s.last_event_id("r").unwrap(), last);
+        assert_eq!(s.last_event_id("nope").unwrap(), 0);
         let none = s.events(&EventFilter {
             run_id: Some("r".into()),
             after_id: Some(last),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert!(none.is_empty());
     }
 
@@ -418,5 +422,9 @@ mod tests {
         s.db.execute_batch("DROP TABLE sessions").unwrap();
         assert!(s.put(&sess("s1", "/b", 2)).is_err());
         assert_eq!(s.get::<Session>("s1").unwrap().cwd, "/a");
+        s.db.execute_batch("DROP TABLE events").unwrap();
+        assert!(s.add_event(&ev(1, Some("r"), None, "k", serde_json::json!({}))).is_err());
+        assert!(s.events(&EventFilter::default()).is_err());
+        assert!(s.last_event_id("r").is_err());
     }
 }
