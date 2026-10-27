@@ -4,6 +4,12 @@ use std::path::{Component, Path, PathBuf};
 /// Strips a leading "./" and turns a trailing "/" into "/**".
 pub fn normalize_glob(glob: &str) -> String {
     let mut g = glob.strip_prefix("./").unwrap_or(glob).to_string();
+    while g.contains("//") {
+        g = g.replace("//", "/");
+    }
+    while g.contains("/./") {
+        g = g.replace("/./", "/");
+    }
     if g.ends_with('/') {
         g.push_str("**");
     }
@@ -59,12 +65,52 @@ pub fn in_scope(file: &str, root: &str, globs: &[String]) -> bool {
             return true;
         }
         // An unparseable glob (e.g. extglob "!(b)") matches nothing.
-        GlobBuilder::new(&g)
+        dot_aware_match(&g, &posix)
+    })
+}
+
+fn seg_match(glob_seg: &str, path_seg: &str) -> bool {
+    if path_seg.starts_with('.') && !glob_seg.starts_with('.') {
+        return false;
+    }
+    GlobBuilder::new(glob_seg)
+        .literal_separator(true)
+        .build()
+        .map(|g| g.compile_matcher().is_match(path_seg))
+        .unwrap_or(false)
+}
+
+/// Node's dot:false rule: a wildcard never matches a segment starting with '.', unless the
+/// glob segment itself starts with '.'. An unparseable glob (e.g. extglob "!(b)") matches nothing.
+fn dot_aware_match(glob: &str, path: &str) -> bool {
+    if glob.contains('{') {
+        // Braces can span separators, so segments are not aligned: use globset, then require
+        // a dot-free path unless the glob mentions a literal dot segment.
+        let ok = GlobBuilder::new(glob)
             .literal_separator(true)
             .build()
-            .map(|glob| glob.compile_matcher().is_match(&posix))
-            .unwrap_or(false)
-    })
+            .map(|g| g.compile_matcher().is_match(path))
+            .unwrap_or(false);
+        let dotty = path.split('/').any(|s| s.starts_with('.'));
+        return ok && (!dotty || glob.contains("/.") || glob.starts_with('.'));
+    }
+    let gs: Vec<&str> = glob.split('/').collect();
+    let ps: Vec<&str> = path.split('/').collect();
+    fn go(gs: &[&str], ps: &[&str]) -> bool {
+        match gs.split_first() {
+            None => ps.is_empty(),
+            Some((&"**", rest)) => {
+                (0..=ps.len()).any(|n| {
+                    ps[..n].iter().all(|p| !p.starts_with('.')) && go(rest, &ps[n..])
+                })
+            }
+            Some((g, rest)) => match ps.split_first() {
+                Some((p, prest)) => seg_match(g, p) && go(rest, prest),
+                None => false,
+            },
+        }
+    }
+    go(&gs, &ps)
 }
 
 /// The leading path segments of a glob that contain no glob characters.
@@ -144,6 +190,25 @@ mod tests {
     fn extglob_and_other_glob_characters_end_the_static_prefix() {
         assert_eq!(static_prefix("src/!(b).ts"), "src");
         assert!(scopes_overlap(&v(&["src/!(b).ts"]), &v(&["src/a.ts"])));
+    }
+
+    #[test]
+    fn wildcards_do_not_match_dot_segments_unless_the_glob_segment_starts_with_a_dot() {
+        assert!(!in_scope("/w/src/.x.ts", "/w", &v(&["src/*.ts"])));
+        assert!(!in_scope("/w/.github/a.md", "/w", &v(&["**/*.md"])));
+        assert!(!in_scope("/w/.env", "/w", &v(&["*"])));
+        assert!(!in_scope("/w/..env", "/w", &v(&["*"])));
+        assert!(in_scope("/w/src/.env", "/w", &v(&["src/.*"])));
+        assert!(in_scope("/w/src/.env", "/w", &v(&["src/**"])));
+        assert!(in_scope("/w/a.md", "/w", &v(&["**/*.md"])));
+        assert!(in_scope("/w/x/y/a.md", "/w", &v(&["**/*.md"])));
+    }
+
+    #[test]
+    fn doubled_and_dot_separators_collapse() {
+        assert!(in_scope("/w/src//a.ts", "/w", &v(&["src/a.ts"])));
+        assert!(in_scope("/w/src/./a.ts", "/w", &v(&["src//a.ts"])));
+        assert!(in_scope("/w/src/a.ts", "/w", &v(&["src/./a.ts"])));
     }
 
     #[test]
