@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "amm": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/amm.js", "shim"]
+    }
+  }
+}
