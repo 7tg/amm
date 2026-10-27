@@ -20,7 +20,7 @@ const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 /// Default kill timeout for one git call.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Runs git in `cwd` with repo-controlled code paths neutralised (replace refs, fsmonitor, hooks) that a worker
+/// Runs git in `cwd` with repo-controlled code paths neutralised (replace refs, grafts, fsmonitor, hooks) that a worker
 /// could plant. Blocking; async callers use `spawn_blocking`. A spawn failure is code 1 with the error as stderr.
 /// Errs if stdout or stderr exceeds 16 MiB, or if git runs longer than `GIT_TIMEOUT` (its process group is killed).
 pub fn git(cwd: &Path, args: &[&str]) -> Result<GitResult, String> {
@@ -55,6 +55,9 @@ fn run(cwd: &Path, args: &[&str], env: &[(String, String)], max: usize, timeout:
         .args(args)
         .current_dir(cwd)
         .env("GIT_NO_REPLACE_OBJECTS", "1")
+        // Grafts rewrite parents, so they could make any commit look like it descends from a base. The path cannot
+        // exist (/dev/null is no directory), and /dev/null itself would make git print a deprecation hint.
+        .env("GIT_GRAFT_FILE", "/dev/null/amm-no-grafts")
         .envs(env.iter().map(|(k, v)| (k, v)))
         // Own process group, so a timeout also kills filters or helpers git started.
         .process_group(0)
@@ -135,11 +138,16 @@ fn real(p: &Path) -> Result<PathBuf, String> {
     p.canonicalize().map_err(|e| format!("{}: {e}", p.display()))
 }
 
-/// Where `cwd` sits: its worktree root, the shared git dir, its branch (None if detached) and HEAD. Errors if git fails.
+/// Where `cwd` sits: its worktree root, the shared git dir, its branch (None if detached) and HEAD. Errors if git
+/// fails or the repository is shallow.
 pub fn worktree_info(cwd: &Path) -> Result<WorktreeInfo, String> {
     let toplevel = real(Path::new(&must(cwd, &["rev-parse", "--show-toplevel"])?))?;
     let common = must(&toplevel, &["rev-parse", "--git-common-dir"])?;
     let common_dir = real(&toplevel.join(common))?;
+    // A shallow file cuts history, so ancestry and merge bases could not be trusted: fail closed.
+    if common_dir.join("shallow").exists() {
+        return Err(format!("{} is a shallow repository; amm needs its full history", toplevel.display()));
+    }
     let b = git(&toplevel, &["symbolic-ref", "--short", "-q", "HEAD"])?;
     let head = must(&toplevel, &["rev-parse", "HEAD"])?;
     let branch = if b.code == 0 && !b.stdout.trim().is_empty() { Some(b.stdout.trim().to_string()) } else { None };
@@ -513,6 +521,30 @@ mod tests {
         fs::write(dir.join("a.txt"), "changed\n").unwrap();
         fs::write(dir.join(".git/index.lock"), "").unwrap();
         assert!(commit_all(&dir, "m").is_err());
+    }
+
+    #[test]
+    fn git_ignores_a_planted_grafts_file() {
+        let dir = repo();
+        let root = head(&dir);
+        fs::write(dir.join("a.txt"), "1\n").unwrap();
+        git_in(&dir, &["commit", "-qam", "one"]);
+        let one = head(&dir);
+        // An unrelated root commit, grafted to look like it descends from `one`.
+        git_in(&dir, &["checkout", "-q", "--orphan", "other"]);
+        git_in(&dir, &["commit", "-qm", "other"]);
+        let other = head(&dir);
+        fs::write(dir.join(".git/info/grafts"), format!("{other} {one}\n")).unwrap();
+        let plain = Command::new("git").args(["merge-base", "--is-ancestor", &root, &other]).current_dir(&dir).status().unwrap();
+        assert!(plain.success(), "graft precondition");
+        assert!(!is_ancestor(&dir, &root, &other).unwrap());
+    }
+
+    #[test]
+    fn worktree_info_refuses_a_shallow_repository() {
+        let dir = repo();
+        fs::write(dir.join(".git/shallow"), format!("{}\n", head(&dir))).unwrap();
+        assert!(worktree_info(&dir).unwrap_err().contains("shallow"));
     }
 
     #[test]
