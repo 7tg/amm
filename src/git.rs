@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
 pub struct GitResult {
@@ -9,23 +10,59 @@ pub struct GitResult {
     pub stderr: String,
 }
 
+/// Output cap per stream; a worker could plant a huge file, and the daemon must not buffer it all.
+const MAX_OUTPUT: usize = 16 * 1024 * 1024;
+
 /// Runs git in `cwd` with repo-controlled code paths neutralised (replace refs, fsmonitor, hooks) that a worker
 /// could plant. Blocking; async callers use `spawn_blocking`. A spawn failure is code 1 with the error as stderr.
-pub fn git(cwd: &Path, args: &[&str]) -> GitResult {
-    let out = Command::new("git")
+/// Errs if stdout or stderr exceeds 16 MiB (the child is killed).
+pub fn git(cwd: &Path, args: &[&str]) -> Result<GitResult, String> {
+    git_capped(cwd, args, MAX_OUTPUT)
+}
+
+fn read_capped<R: Read>(r: R, max: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut buf = Vec::new();
+    r.take(max as u64 + 1).read_to_end(&mut buf)?;
+    let over = buf.len() > max;
+    Ok((buf, over))
+}
+
+fn git_capped(cwd: &Path, args: &[&str], max: usize) -> Result<GitResult, String> {
+    let spawned = Command::new("git")
         .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"])
         .args(args)
         .current_dir(cwd)
         .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .output();
-    match out {
-        Ok(o) => GitResult {
-            code: o.status.code().unwrap_or(1),
-            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
-        },
-        Err(e) => GitResult { code: 1, stdout: String::new(), stderr: e.to_string() },
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => return Ok(GitResult { code: 1, stdout: String::new(), stderr: e.to_string() }),
+    };
+    let err_pipe = child.stderr.take().ok_or("no stderr pipe")?;
+    let out_pipe = child.stdout.take().ok_or("no stdout pipe")?;
+    let err_thread = std::thread::spawn(move || read_capped(err_pipe, max));
+    let out = read_capped(out_pipe, max);
+    if matches!(out, Ok((_, true))) {
+        let _ = child.kill();
     }
+    // Reading stdout to EOF (or killing) lets stderr finish, then the child can be reaped.
+    let err = err_thread.join().map_err(|_| "git stderr reader panicked".to_string())?;
+    let (stdout, out_over) = out.map_err(|e| e.to_string())?;
+    let (stderr, err_over) = err.map_err(|e| e.to_string())?;
+    if out_over || err_over {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("git {} output exceeds {max} bytes", args.first().copied().unwrap_or("")));
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    Ok(GitResult {
+        code: status.code().unwrap_or(1),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,9 +75,9 @@ pub struct WorktreeInfo {
 }
 
 fn raw(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let r = git(cwd, args);
+    let r = git(cwd, args)?;
     if r.code != 0 {
-        return Err(format!("git {} failed: {}", args[0], r.stderr.trim()));
+        return Err(format!("git {} failed: {}", args.first().copied().unwrap_or(""), r.stderr.trim()));
     }
     Ok(r.stdout)
 }
@@ -58,7 +95,7 @@ pub fn worktree_info(cwd: &Path) -> Result<WorktreeInfo, String> {
     let toplevel = real(Path::new(&must(cwd, &["rev-parse", "--show-toplevel"])?))?;
     let common = must(&toplevel, &["rev-parse", "--git-common-dir"])?;
     let common_dir = real(&toplevel.join(common))?;
-    let b = git(&toplevel, &["symbolic-ref", "--short", "-q", "HEAD"]);
+    let b = git(&toplevel, &["symbolic-ref", "--short", "-q", "HEAD"])?;
     let head = must(&toplevel, &["rev-parse", "HEAD"])?;
     let branch = if b.code == 0 && !b.stdout.trim().is_empty() { Some(b.stdout.trim().to_string()) } else { None };
     Ok(WorktreeInfo { toplevel, common_dir, branch, head })
@@ -110,7 +147,7 @@ mod tests {
     }
 
     fn head(dir: &Path) -> String {
-        git(dir, &["rev-parse", "HEAD"]).stdout.trim().to_string()
+        git(dir, &["rev-parse", "HEAD"]).unwrap().stdout.trim().to_string()
     }
 
     fn sorted(mut v: Vec<String>) -> Vec<String> {
@@ -190,11 +227,67 @@ mod tests {
     }
 
     #[test]
-    fn git_neutralises_repo_planted_hooks_path_and_replace_refs() {
+    fn git_ignores_planted_fsmonitor_hooks_path_and_replace_refs() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = repo();
-        let r = git(&dir, &["config", "--get", "core.hooksPath"]);
-        // -c wins over repo config, so the effective value is /dev/null
-        assert_eq!(r.stdout.trim(), "/dev/null");
-        assert_eq!(git(&dir, &["config", "--get", "core.fsmonitor"]).stdout.trim(), "false");
+        let marker = tmp_dir().join("ran");
+        let script_dir = tmp_dir();
+        let exe = |name: &str, body: &str| {
+            let p = script_dir.join(name);
+            fs::write(&p, format!("#!/bin/sh\ntouch {}\n{body}", marker.display())).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let fsmon = exe("fsmon", "");
+        let hooks = script_dir.join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        git_in(&dir, &["config", "core.fsmonitor", fsmon.to_str().unwrap()]);
+        git_in(&dir, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        // a replace ref turning a.txt's blob into different content
+        let orig = git(&dir, &["rev-parse", "HEAD:a.txt"]).unwrap().stdout.trim().to_string();
+        let fake_file = script_dir.join("fake");
+        fs::write(&fake_file, "fake\n").unwrap();
+        let fake = git(&dir, &["hash-object", "-w", fake_file.to_str().unwrap()]).unwrap().stdout.trim().to_string();
+        git_in(&dir, &["replace", &orig, &fake]);
+
+        // precondition: unhardened git does fall for all three
+        let plain = |a: &[&str]| {
+            Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(a)
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+        };
+        assert_eq!(String::from_utf8_lossy(&plain(&["show", "HEAD:a.txt"]).stdout), "fake\n");
+        plain(&["status"]);
+        assert!(marker.exists(), "fsmonitor precondition");
+        fs::remove_file(&marker).unwrap();
+        fs::write(dir.join("b.txt"), "b\n").unwrap();
+        plain(&["add", "b.txt"]);
+        plain(&["commit", "-qm", "x"]);
+        assert!(marker.exists(), "hook precondition");
+        fs::remove_file(&marker).unwrap();
+
+        // hardened: none of them takes effect
+        assert_eq!(git(&dir, &["show", "HEAD:a.txt"]).unwrap().stdout, "a\n");
+        git(&dir, &["status"]).unwrap();
+        fs::write(dir.join("c.txt"), "c\n").unwrap();
+        git(&dir, &["add", "c.txt"]).unwrap();
+        let c = git(&dir, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "y"]).unwrap();
+        assert_eq!(c.code, 0, "{}", c.stderr);
+        assert!(!marker.exists(), "planted fsmonitor or hook ran");
+    }
+
+    #[test]
+    fn git_errors_when_output_exceeds_the_cap() {
+        let dir = repo();
+        let big = git_capped(&dir, &["show", "HEAD:a.txt"], 1);
+        assert!(big.unwrap_err().contains("exceeds"));
+        let ok = git_capped(&dir, &["show", "HEAD:a.txt"], 2).unwrap();
+        assert_eq!(ok.stdout, "a\n");
     }
 }
