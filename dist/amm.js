@@ -7252,7 +7252,7 @@ var require_dist = __commonJS({
 });
 
 // src/daemon.ts
-import crypto2 from "node:crypto";
+import crypto3 from "node:crypto";
 import fs4 from "node:fs";
 import path5 from "node:path";
 
@@ -7292,6 +7292,7 @@ function toolName(tool, env = process.env) {
 }
 
 // src/http.ts
+import crypto from "node:crypto";
 import http from "node:http";
 
 // src/hooks.ts
@@ -7727,32 +7728,65 @@ var OPS = {
     return "cancelled";
   }
 };
+var MAX_BODY = 1e6;
+function tokenOk(given, token) {
+  if (typeof given !== "string") return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(token);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 function createServer(amm, token, onActivity) {
-  return http.createServer(async (req, res) => {
-    onActivity();
+  const handle = async (req, res) => {
     const send = (code, body) => {
       res.writeHead(code, { "content-type": "application/json" });
       res.end(JSON.stringify(body));
     };
-    const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    if (req.method === "GET" && url.pathname === "/health") return send(200, { ok: true, pid: process.pid });
-    if (req.headers["x-amm-token"] !== token) return send(401, { error: "bad token" });
-    let raw2 = "";
-    for await (const chunk of req) raw2 += chunk;
     try {
+      const port = req.socket.localPort;
+      if (req.headers.host !== `127.0.0.1:${port}` && req.headers.host !== `localhost:${port}`) return send(403, { error: "bad host" });
+      if (!tokenOk(req.headers["x-amm-token"], token)) return send(401, { error: "bad token" });
+      onActivity();
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (req.method === "GET" && url.pathname === "/health") return send(200, { ok: true, pid: process.pid });
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of req) {
+        size += chunk.length;
+        if (size > MAX_BODY) {
+          res.writeHead(413, { "content-type": "application/json", connection: "close" });
+          res.end(JSON.stringify({ error: "body too large" }), () => req.destroy());
+          return;
+        }
+        chunks.push(chunk);
+      }
+      const raw2 = Buffer.concat(chunks).toString("utf8");
       const body = raw2 ? JSON.parse(raw2) : {};
       const [, kind, name] = url.pathname.split("/");
-      if (req.method === "POST" && kind === "api" && name in OPS) return send(200, { result: await OPS[name](amm, body) });
+      if (req.method === "POST" && kind === "api" && Object.hasOwn(OPS, name)) return send(200, { result: await OPS[name](amm, body) });
       if (req.method === "POST" && kind === "hook") return send(200, await handleHook(amm, name, body));
       send(404, { error: "not found" });
     } catch (e) {
-      send(400, { error: e.message });
+      if (res.headersSent) res.destroy();
+      else send(400, { error: e.message });
     }
+  };
+  return http.createServer((req, res) => {
+    handle(req, res).catch(() => {
+      if (res.headersSent) req.socket.destroy();
+      else {
+        try {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end('{"error":"internal"}');
+        } catch {
+          req.socket.destroy();
+        }
+      }
+    });
   });
 }
 
 // src/service.ts
-import crypto from "node:crypto";
+import crypto2 from "node:crypto";
 import fs3 from "node:fs";
 
 // src/plan-import.ts
@@ -7839,7 +7873,7 @@ var Semaphores = class {
 };
 
 // src/service.ts
-var newId = (prefix) => prefix + crypto.randomBytes(3).toString("hex");
+var newId = (prefix) => prefix + crypto2.randomBytes(3).toString("hex");
 var ACTIVE = ["starting", "running", "checking"];
 var NOTABLE = /* @__PURE__ */ new Set(["done", "escalate", "failed", "blocked", "lost", "cancel"]);
 var Amm = class {
@@ -8323,7 +8357,7 @@ function readLock(home = ammHome()) {
 async function isHealthy(lock) {
   if (!lock) return false;
   try {
-    const r = await fetch(`http://127.0.0.1:${lock.port}/health`, { signal: AbortSignal.timeout(1e3) });
+    const r = await fetch(`http://127.0.0.1:${lock.port}/health`, { headers: { "x-amm-token": lock.token }, signal: AbortSignal.timeout(1e3) });
     return r.ok && (await r.json()).pid === lock.pid;
   } catch {
     return false;
@@ -8351,11 +8385,14 @@ async function listen(server, start, home) {
 async function runDaemon(opts = {}) {
   const home = opts.home ?? ammHome();
   fs4.mkdirSync(home, { recursive: true, mode: 448 });
+  fs4.chmodSync(home, 448);
   if (await isHealthy(readLock(home))) return null;
   const limits = loadLimits();
-  const store = new Store(path5.join(home, "amm.db"));
+  const dbPath = path5.join(home, "amm.db");
+  if (!fs4.existsSync(dbPath)) fs4.closeSync(fs4.openSync(dbPath, "a", 384));
+  const store = new Store(dbPath);
   const amm = new Amm(store, limits);
-  const token = crypto2.randomBytes(16).toString("hex");
+  const token = crypto3.randomBytes(16).toString("hex");
   let lastActivity = Date.now();
   const server = createServer(amm, token, () => {
     lastActivity = Date.now();
@@ -8365,19 +8402,27 @@ async function runDaemon(opts = {}) {
     store.close();
     return null;
   }
-  fs4.writeFileSync(lockPath(home), JSON.stringify({ pid: process.pid, port, token }), { mode: 384 });
+  const tmp = `${lockPath(home)}.${process.pid}.tmp`;
+  fs4.writeFileSync(tmp, JSON.stringify({ pid: process.pid, port, token }), { mode: 384 });
+  fs4.renameSync(tmp, lockPath(home));
   let closed = false;
   const close = async () => {
     if (closed) return;
     closed = true;
     clearInterval(timer);
-    await new Promise((r) => server.close(() => r()));
+    const done = new Promise((r) => server.close(() => r()));
+    server.closeAllConnections();
+    await done;
     store.close();
     if (readLock(home)?.pid === process.pid && readLock(home)?.port === port) fs4.rmSync(lockPath(home), { force: true });
   };
   const timer = setInterval(() => {
-    amm.sweep();
-    if (Date.now() - lastActivity > limits.idleShutdownMs && amm.activeWorkers().length === 0) void close();
+    try {
+      amm.sweep();
+      if (Date.now() - lastActivity > limits.idleShutdownMs && amm.activeWorkers().length === 0) void close();
+    } catch (e) {
+      console.error("amm: sweep failed:", e);
+    }
   }, 3e4);
   timer.unref();
   return { port, close };
@@ -8387,6 +8432,7 @@ async function runDaemon(opts = {}) {
 import { spawn as spawn2 } from "node:child_process";
 import fs5 from "node:fs";
 import path6 from "node:path";
+import { fileURLToPath } from "node:url";
 
 // node_modules/zod/v3/external.js
 var external_exports = {};
@@ -22703,7 +22749,11 @@ async function ensureDaemon(home = ammHome()) {
   if (lock && await isHealthy(lock)) return lock;
   fs5.mkdirSync(home, { recursive: true, mode: 448 });
   const log = fs5.openSync(path6.join(home, "daemon.log"), "a");
-  spawn2(process.execPath, [process.argv[1], "daemon"], { detached: true, stdio: ["ignore", log, log], env: process.env }).unref();
+  try {
+    spawn2(process.execPath, [fileURLToPath(import.meta.url), "daemon"], { detached: true, stdio: ["ignore", log, log], env: process.env }).unref();
+  } finally {
+    fs5.closeSync(log);
+  }
   for (let i = 0; i < 50; i++) {
     await new Promise((r) => setTimeout(r, 100));
     lock = readLock(home);
@@ -22718,13 +22768,14 @@ async function callDaemon(op, args) {
       const res = await fetch(`http://127.0.0.1:${lock.port}/api/${op}`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-amm-token": lock.token },
-        body: JSON.stringify(args)
+        body: JSON.stringify(args),
+        signal: AbortSignal.timeout(3e4)
       });
       const body = await res.json();
       if (!res.ok) throw new Error(body.error ?? `http ${res.status}`);
       return body.result;
     } catch (e) {
-      if (attempt > 0 || !(e instanceof TypeError)) throw e;
+      if (attempt > 0 || e.cause?.code !== "ECONNREFUSED") throw e;
     }
   }
 }
@@ -22796,7 +22847,11 @@ if (cmd === "daemon") {
   const d = await runDaemon({ port });
   if (!d) process.exit(0);
   console.log(`amm daemon pid ${process.pid} on 127.0.0.1:${d.port}`);
-  for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => void d.close().then(() => process.exit(0)));
+  for (const sig of ["SIGINT", "SIGTERM"])
+    process.on(sig, () => {
+      setTimeout(() => process.exit(1), 5e3).unref();
+      void d.close().then(() => process.exit(0));
+    });
 } else if (cmd === "shim") {
   await runShim();
 } else {
