@@ -1,4 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// Injectable clock, in ms since the epoch.
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
