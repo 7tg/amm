@@ -59,7 +59,7 @@ fn err<T>(msg: String) -> AmmResult<T> {
 pub struct StartRun {
     pub repo: String,
     pub test_cmd: String,
-    pub base_branch: Option<String>,
+    pub base_branch: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,6 +137,16 @@ pub fn validate_worktree(run_repo: &Path, cwd: &Path) -> Result<WorktreeCheck, S
     Ok(WorktreeCheck { toplevel: info.toplevel.to_string_lossy().into_owned(), branch, base_sha: sha.to_string() })
 }
 
+/// The branch checked out in `repo`, for runs started without a base branch. Runs git; call it without the lock.
+pub fn resolve_base_branch(repo: &Path) -> Result<String, String> {
+    let r = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let b = r.stdout.trim();
+    if r.code != 0 || b.is_empty() {
+        return Err(format!("could not resolve the base branch of {}: {}", repo.display(), r.stderr.trim()));
+    }
+    Ok(b.to_string())
+}
+
 /// A JSON object, for event details.
 fn obj(v: Value) -> Map<String, Value> {
     match v {
@@ -152,6 +162,8 @@ pub struct Amm {
     pub now: Clock,
     /// Process env, for the agent and tool name prefixes.
     pub env: Env,
+    /// Most notable events one `status` call reports; the rest wait for the next call.
+    pub status_limit: i64,
 }
 
 impl Amm {
@@ -168,7 +180,7 @@ impl Amm {
             let remaining = (w.last_event_at + limits.lease_ms + extra - t).max(1);
             sem.try_acquire("workers", &w.id, UNBOUNDED, remaining);
         }
-        Amm { store, sem, limits, now, env }
+        Amm { store, sem, limits, now, env, status_limit: 10000 }
     }
 
     fn t(&self) -> i64 {
@@ -195,7 +207,7 @@ impl Amm {
         self.store.get::<Brief>(brief_id).ok_or_else(|| AmmError(format!("unknown brief {brief_id}")))
     }
 
-    /// Starts a run. With no `base_branch` this runs git under the caller's lock; the daemon resolves it first.
+    /// Starts a run. Runs no git: callers resolve a missing base branch with `resolve_base_branch` first.
     pub fn start_run(&mut self, input: StartRun) -> AmmResult<Run> {
         let p = Path::new(&input.repo);
         let repo = if p.exists() {
@@ -203,10 +215,7 @@ impl Amm {
         } else {
             input.repo.clone()
         };
-        let base_branch = match input.base_branch {
-            Some(b) => b,
-            None => git(Path::new(&repo), &["rev-parse", "--abbrev-ref", "HEAD"])?.stdout.trim().to_string(),
-        };
+        let base_branch = input.base_branch;
         let run = Run {
             id: new_id("r"),
             repo,
@@ -502,11 +511,15 @@ impl Amm {
                     run_id: Some(r.id.clone()),
                     after_id: Some(r.status_cursor),
                     kinds: Some(NOTABLE.iter().map(|s| s.to_string()).collect()),
-                    limit: Some(10000),
+                    limit: Some(self.status_limit),
                     ..Default::default()
                 })?;
                 out.extend(fresh.iter().map(|e| format!("  {}", describe(e))));
-                let last = self.store.last_event_id(&r.id)?;
+                // A full page may have more behind it: stop the cursor at its end so the next call shows the rest.
+                let last = match fresh.last() {
+                    Some(e) if fresh.len() as i64 >= self.status_limit.clamp(1, 10000) => e.id, // the store clamps the same way
+                    _ => self.store.last_event_id(&r.id)?,
+                };
                 if last > r.status_cursor {
                     let cur = self.run(&r.id)?;
                     self.store.put(&Run { status_cursor: last, ..cur })?;
@@ -593,14 +606,19 @@ impl Amm {
                 Err(error)
             }
             Ok(c) => {
-                let d = detail(serde_json::json!({ "worktree": c.toplevel }));
+                let toplevel = c.toplevel.clone();
+                // Guarded too: a cancel or sweep that landed while we validated must get no worktree written.
+                let bound = self
+                    .transition(&w, &[WorkerState::Running], |x| {
+                        x.worktree = Some(c.toplevel);
+                        x.branch = Some(c.branch);
+                        x.base_sha = Some(c.base_sha);
+                    })
+                    .map_err(|e| e.0)?;
+                let Some(bound) = bound else { return Err("brief was cancelled".into()) };
+                let d = detail(serde_json::json!({ "worktree": toplevel }));
                 self.event("bind", Some(&w.run_id), Some(&w.id), d).map_err(|e| e.0)?;
-                self.put_worker(&w, |x| {
-                    x.worktree = Some(c.toplevel);
-                    x.branch = Some(c.branch);
-                    x.base_sha = Some(c.base_sha);
-                })
-                .map_err(|e| e.0)
+                Ok(bound)
             }
         }
     }
@@ -874,7 +892,7 @@ mod service_tests {
         let mut h = make_amm(limits);
         let run = h
             .amm
-            .start_run(StartRun { repo: "/repo".into(), test_cmd: "npm test".into(), base_branch: Some("main".into()) })
+            .start_run(StartRun { repo: "/repo".into(), test_cmd: "npm test".into(), base_branch: "main".into() })
             .unwrap();
         (h, run)
     }
@@ -1024,7 +1042,7 @@ mod lifecycle_tests {
             .start_run(StartRun {
                 repo: repo.to_string_lossy().into_owned(),
                 test_cmd: "npm test".into(),
-                base_branch: Some("main".into()),
+                base_branch: "main".into(),
             })
             .unwrap();
         let b = h.amm.add_brief(&run.id, light("t", "src/**", checks), BriefState::Queued).unwrap();
@@ -1156,6 +1174,33 @@ mod lifecycle_tests {
         );
     }
 
+    // Not in the TS suite: a successful validation must not write into a worker cancelled meanwhile.
+    #[test]
+    fn finish_bind_after_a_cancel_writes_nothing_even_when_validation_succeeds() {
+        let (mut h, run, b, repo) = started(DEFAULT_LIMITS);
+        let amm = &mut h.amm;
+        let wt = wt(&repo);
+        let BindClaim::Claimed(w) = amm.claim_bind(&b.id, "agent-1", &wt).unwrap() else {
+            panic!("expected a fresh claim");
+        };
+        amm.cancel(&b.id).unwrap();
+        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &wt);
+        assert!(check.is_ok());
+        assert_eq!(amm.finish_bind(&w.id, check).unwrap_err(), "brief was cancelled");
+        let after = amm.store.get::<Worker>(&w.id).unwrap();
+        assert_eq!(after.state, WorkerState::Cancelled);
+        assert_eq!((after.branch, after.base_sha), (None, None));
+        // The claim's worktree (cwd) is left as the claim wrote it; finish_bind adds nothing.
+        assert_eq!(after.worktree, w.worktree);
+    }
+
+    // Not in the TS suite: the daemon resolves the base branch before it takes the lock.
+    #[test]
+    fn resolve_base_branch_reads_the_checked_out_branch() {
+        assert_eq!(resolve_base_branch(&init_repo()).unwrap(), "main");
+        assert!(resolve_base_branch(Path::new("/nonexistent-amm-repo")).is_err());
+    }
+
     #[test]
     fn a_concurrent_cancel_is_not_overwritten_when_bind_refuses() {
         let (mut h, run, b, repo) = started(DEFAULT_LIMITS);
@@ -1187,7 +1232,7 @@ mod review_tests {
         let mut h = make_amm(DEFAULT_LIMITS);
         let run = h
             .amm
-            .start_run(StartRun { repo: "/repo".into(), test_cmd: "t".into(), base_branch: Some("main".into()) })
+            .start_run(StartRun { repo: "/repo".into(), test_cmd: "t".into(), base_branch: "main".into() })
             .unwrap();
         (h, run)
     }
@@ -1229,6 +1274,22 @@ mod review_tests {
         amm.event("done", Some(&run.id), None, serde_json::json!({ "briefId": "bx", "title": "zz" })).unwrap();
         assert!(amm.status(Some(&run.id), false).unwrap().contains("bx done: zz"));
         assert!(!amm.status(Some(&run.id), false).unwrap().contains("bx done"));
+    }
+
+    // Not in the TS suite: a full page of notable events leaves the rest for the next call.
+    #[test]
+    fn status_pages_notable_events_when_the_limit_is_hit() {
+        let (mut h, run) = setup();
+        let amm = &mut h.amm;
+        amm.status_limit = 2;
+        for id in ["b1", "b2", "b3"] {
+            amm.event("done", Some(&run.id), None, serde_json::json!({ "briefId": id, "title": "t" })).unwrap();
+        }
+        let first = amm.status(Some(&run.id), false).unwrap();
+        assert!(first.contains("b1 done") && first.contains("b2 done") && !first.contains("b3 done"), "{first}");
+        let second = amm.status(Some(&run.id), false).unwrap();
+        assert!(second.contains("b3 done") && !second.contains("b1 done"), "{second}");
+        assert!(!amm.status(Some(&run.id), false).unwrap().contains("done:"));
     }
 
     #[test]
@@ -1323,7 +1384,7 @@ mod review_tests {
             .start_run(StartRun {
                 repo: h.dir.to_string_lossy().into_owned(),
                 test_cmd: "t".into(),
-                base_branch: Some("main".into()),
+                base_branch: "main".into(),
             })
             .unwrap();
         assert_eq!(run.repo, h.dir.canonicalize().unwrap().to_string_lossy());
