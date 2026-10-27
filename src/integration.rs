@@ -26,13 +26,15 @@ fn fail(what: &str, stderr: &str) -> String {
 
 /// Creates `<repo>/.claude/worktrees/amm-<run>` on a new branch `amm/<run>` at `base_branch`, and returns its real
 /// path and the base commit, which becomes the run's trusted integration head. The checkout runs no filter (smudge
-/// included), hook or fsmonitor. On any error the half-made worktree and branch are removed.
+/// included), hook or fsmonitor, and takes attributes only from the base commit's tree. On any error the half-made
+/// worktree and branch are removed.
 pub fn create_worktree(repo: &Path, run_id: &str, base_branch: &str) -> Result<(PathBuf, String), String> {
     let base = git(repo, &["rev-parse", "--verify", "--end-of-options", &format!("{base_branch}^{{commit}}")])?;
     let sha = base.stdout.trim().to_string();
     if base.code != 0 || sha.is_empty() {
         return Err(fail(&format!("base branch {base_branch} is not a commit"), &base.stderr));
     }
+    let base_tree = tree_of(repo, &sha)?;
     let path = worktree_path(repo, run_id);
     let branch = integration_branch(run_id);
     // Never clean up what amm did not make: refuse a branch or path that already exists.
@@ -42,7 +44,7 @@ pub fn create_worktree(repo: &Path, run_id: &str, base_branch: &str) -> Result<(
     }
     let made = (|| {
         let path_s = path.to_string_lossy();
-        let r = git_checkout(repo, &["worktree", "add", "-q", "-b", &branch, "--end-of-options", &path_s, &sha])?;
+        let r = git_checkout(repo, &base_tree, &["worktree", "add", "-q", "-b", &branch, "--end-of-options", &path_s, &sha])?;
         if r.code != 0 {
             return Err(fail("could not create the integration worktree", &r.stderr));
         }
@@ -59,6 +61,16 @@ pub fn create_worktree(repo: &Path, run_id: &str, base_branch: &str) -> Result<(
     }
 }
 
+/// The tree of commit `sha`.
+fn tree_of(dir: &Path, sha: &str) -> Result<String, String> {
+    let r = git(dir, &["rev-parse", "--verify", "--end-of-options", &format!("{sha}^{{tree}}")])?;
+    let t = r.stdout.trim();
+    if r.code != 0 || t.is_empty() {
+        return Err(fail(&format!("{sha} is not a commit"), &r.stderr));
+    }
+    Ok(t.to_string())
+}
+
 /// The worktree is on `refs/heads/<branch>`, the branch is on `sha`, and nothing differs from it but ignored files.
 pub fn verify_clean(wt: &Path, branch: &str, sha: &str) -> Result<(), String> {
     let sym = git(wt, &["symbolic-ref", "-q", "HEAD"])?;
@@ -69,7 +81,8 @@ pub fn verify_clean(wt: &Path, branch: &str, sha: &str) -> Result<(), String> {
     if at.code != 0 || at.stdout.trim() != sha {
         return Err(format!("{branch} is not on {sha}"));
     }
-    let st = git_checkout(wt, &["status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none"])?;
+    let tree = tree_of(wt, sha)?;
+    let st = git_checkout(wt, &tree, &["status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none"])?;
     if st.code != 0 {
         return Err(fail("git status failed", &st.stderr));
     }
@@ -133,6 +146,8 @@ enum Outcome {
 /// One merge, as the blocking phase needs it.
 #[derive(Clone)]
 struct Job {
+    /// The run's repository: the worktree must still share its git dir.
+    repo: PathBuf,
     wt: PathBuf,
     branch: String,
     /// `Run.integration_head`: where amm left the branch.
@@ -151,24 +166,28 @@ fn rev(wt: &Path, r: &str) -> Option<String> {
     (o.code == 0 && !s.is_empty()).then(|| s.to_string())
 }
 
-/// The integration worktree must be on `refs/heads/<branch>`, and the branch on `head`.
-fn verify_at(wt: &Path, branch: &str, head: &str) -> Result<(), String> {
-    let sym = git(wt, &["symbolic-ref", "-q", "HEAD"])?;
-    if sym.code != 0 || sym.stdout.trim() != format!("refs/heads/{branch}") {
+/// The integration worktree must still be a worktree of `repo`, on `refs/heads/<branch>`, with the branch and HEAD on
+/// `head`.
+fn verify_at(repo: &Path, wt: &Path, branch: &str, head: &str) -> Result<(), String> {
+    let (mine, theirs) = (crate::git::worktree_info(wt)?, crate::git::worktree_info(repo)?);
+    if mine.common_dir != theirs.common_dir || mine.toplevel != wt {
+        return Err("the integration worktree is no longer a worktree of the repository".into());
+    }
+    if mine.branch.as_deref() != Some(branch) {
         return Err(format!("the integration worktree is no longer on {branch}"));
     }
     match rev(wt, &format!("refs/heads/{branch}^{{commit}}")) {
-        Some(at) if at == head => Ok(()),
+        Some(at) if at == head && mine.head == head => Ok(()),
         Some(at) => Err(format!("{branch} is on {at}, not on {head} where amm left it")),
         None => Err(format!("{branch} cannot be read")),
     }
 }
 
 /// Puts the worktree's files back to `sha`: tracked files reset, untracked files removed (ignored ones, such as
-/// installed dependencies, stay).
-fn reset_to(wt: &Path, sha: &str) -> Result<(), String> {
+/// installed dependencies, stay). Attributes come from `attr_tree`.
+fn reset_to(wt: &Path, attr_tree: &str, sha: &str) -> Result<(), String> {
     for args in [&["reset", "-q", "--hard", sha][..], &["clean", "-q", "-f", "-d"][..]] {
-        let r = git_checkout(wt, args)?;
+        let r = git_checkout(wt, attr_tree, args)?;
         if r.code != 0 {
             return Err(format!("git {} failed: {}", args[0], first_line(&r.stderr)));
         }
@@ -176,77 +195,119 @@ fn reset_to(wt: &Path, sha: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Back to `head` after a failed attempt; if even that fails, the run cannot go on safely.
-fn back_to(job: &Job, outcome: Outcome) -> Outcome {
-    let _ = git_checkout(&job.wt, &["merge", "--abort"]);
-    match reset_to(&job.wt, &job.head).and_then(|_| verify_at(&job.wt, &job.branch, &job.head)) {
-        Ok(()) => outcome,
-        Err(e) => Outcome::Diverged(e),
+/// Moves `refs/heads/<branch>` from `old` to `new`, only if it is still on `old`.
+fn cas(wt: &Path, branch: &str, new: &str, old: &str) -> Result<(), String> {
+    let r = git(wt, &["update-ref", "-m", "amm: integrate", "--end-of-options", &format!("refs/heads/{branch}"), new, old])?;
+    if r.code != 0 {
+        return Err(format!("{branch} moved under amm: {}", first_line(&r.stderr)));
     }
+    Ok(())
 }
 
-/// The blocking phase: merge `gated` into the integration worktree and run the tests there.
+/// Takes amm's merge `new` back off the branch: the ref back to `head` (only if it is still on `new`), HEAD back on
+/// the branch, the files back to `head`.
+fn undo(job: &Job, new: &str) -> Result<(), String> {
+    let wt = job.wt.as_path();
+    cas(wt, &job.branch, &job.head, new)?;
+    let _ = git(wt, &["symbolic-ref", "HEAD", &format!("refs/heads/{}", job.branch)]);
+    reset_to(wt, &tree_of(wt, &job.head)?, &job.head)?;
+    verify_at(&job.repo, wt, &job.branch, &job.head)
+}
+
+/// The blocking phase. The merge is built without the worktree (`merge-tree`), scope-checked, committed and put on
+/// the branch with a compare-and-swap; only then is the worktree checked out at it and the tests run. Attributes come
+/// from the head's tree, never from the gated commit.
 fn merge_one(job: &Job) -> Outcome {
     let wt = job.wt.as_path();
-    if let Err(e) = verify_at(wt, &job.branch, &job.head) {
+    if let Err(e) = verify_at(&job.repo, wt, &job.branch, &job.head) {
         return Outcome::Diverged(e);
     }
-    if let Err(e) = reset_to(wt, &job.head) {
-        return back_to(job, Outcome::Error(e));
+    let head_tree = match tree_of(wt, &job.head) {
+        Ok(t) => t,
+        Err(e) => return Outcome::Diverged(e),
+    };
+    if let Err(e) = reset_to(wt, &head_tree, &job.head) {
+        return Outcome::Error(e);
     }
     if rev(wt, &format!("{}^{{commit}}", job.gated)).as_deref() != Some(job.gated.as_str()) {
         return Outcome::Error(format!("commit {} is missing", job.gated));
     }
-    let merge = git_checkout(wt, &["merge", "-q", "--no-ff", "--no-edit", "--no-verify", "-m", &job.message, "--end-of-options", &job.gated]);
-    let merge = match merge {
+    let mt = git_checkout(
+        wt,
+        &head_tree,
+        &["merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", "--end-of-options", &job.head, &job.gated],
+    );
+    let mt = match mt {
         Ok(m) => m,
-        Err(e) => return back_to(job, Outcome::Error(e)),
+        Err(e) => return Outcome::Error(e),
     };
-    if merge.code != 0 {
-        let unmerged = git(wt, &["diff", "--name-only", "-z", "--diff-filter=U"]).map(|r| r.stdout).unwrap_or_default();
-        let files: Vec<String> = unmerged.split('\0').filter(|f| !f.is_empty()).map(str::to_string).collect();
-        let outcome = if files.is_empty() {
-            Outcome::Error(format!("git merge failed: {}", first_line(&format!("{}{}", merge.stderr, merge.stdout))))
-        } else {
-            Outcome::Conflict { files }
-        };
-        return back_to(job, outcome);
-    }
-    // The merge must be exactly amm's: a merge commit of `head` and `gated`, with the branch on it.
-    let new = rev(wt, "HEAD^{commit}").unwrap_or_default();
-    let parents = (rev(wt, &format!("{new}^1")), rev(wt, &format!("{new}^2")));
-    if parents != (Some(job.head.clone()), Some(job.gated.clone())) || verify_at(wt, &job.branch, &new).is_err() {
-        return back_to(job, Outcome::Error("the merge did not produce the expected merge commit".into()));
+    let mut fields = mt.stdout.split('\0').filter(|f| !f.is_empty());
+    let tree = fields.next().unwrap_or("").trim().to_string();
+    match mt.code {
+        0 if !tree.is_empty() => {}
+        1 => {
+            let mut files: Vec<String> = fields.map(str::to_string).collect();
+            files.dedup();
+            return Outcome::Conflict { files };
+        }
+        _ => return Outcome::Error(format!("git merge-tree failed: {}", first_line(&mt.stderr))),
     }
     // Defence in depth: the gate scope-checked the worker's diff from its own base, but the merge applies the diff
-    // from git's merge base, which a crafted history (a criss-cross) can move. Check what actually changed.
-    let changed = match committed_files(wt, &job.head, &new) {
+    // from git's merge base, which a crafted history (a criss-cross) can move. Check what the merge changes.
+    let changed = match committed_files(wt, &job.head, &tree) {
         Ok(f) => f,
-        Err(e) => return back_to(job, Outcome::Error(e)),
+        Err(e) => return Outcome::Error(e),
     };
     let root = wt.to_string_lossy();
     let outside: Vec<String> = changed.into_iter().filter(|f| !in_scope(&wt.join(f).to_string_lossy(), &root, &job.scope)).collect();
     if !outside.is_empty() {
-        return back_to(job, Outcome::ScopeViolation { files: outside });
+        return Outcome::ScopeViolation { files: outside };
+    }
+    let commit = git_checkout(
+        wt,
+        &head_tree,
+        &["commit-tree", "--no-gpg-sign", "-p", &job.head, "-p", &job.gated, "-m", &job.message, "--end-of-options", &tree],
+    );
+    let new = match commit {
+        Ok(c) if c.code == 0 && !c.stdout.trim().is_empty() => c.stdout.trim().to_string(),
+        Ok(c) => return Outcome::Error(format!("git commit-tree failed: {}", first_line(&c.stderr))),
+        Err(e) => return Outcome::Error(e),
+    };
+    if let Err(e) = cas(wt, &job.branch, &new, &job.head) {
+        return Outcome::Diverged(e);
+    }
+    if let Err(e) = reset_to(wt, &head_tree, &new) {
+        return match undo(job, &new) {
+            Ok(()) => Outcome::Error(e),
+            Err(u) => Outcome::Diverged(u),
+        };
     }
     let r = run_check(&job.test_cmd, wt, job.budget_ms);
-    // The tests run repo code: the branch must still be on the merge amm made.
-    if let Err(e) = verify_at(wt, &job.branch, &new) {
+    // The tests run repo code: HEAD, the branch and the tree must still be amm's merge.
+    let intact = verify_at(&job.repo, wt, &job.branch, &new).and_then(|_| match rev(wt, "HEAD^{tree}") {
+        Some(t) if t == tree => Ok(()),
+        _ => Err("HEAD no longer holds amm's merge".into()),
+    });
+    if let Err(e) = intact {
+        let _ = undo(job, &new);
         return Outcome::Diverged(format!("after the integration tests: {e}"));
     }
     if r.ok {
-        let _ = reset_to(wt, &new);
+        let _ = reset_to(wt, &head_tree, &new);
         return Outcome::Merged { new };
     }
     let how = if r.timed_out { "timed out".to_string() } else { format!("exited {}", r.code.map_or("null".into(), |c| c.to_string())) };
     let tail = tail(&format!("`{}` {how}:\n{}", job.test_cmd, r.output), NOTE_TAIL);
-    back_to(job, Outcome::TestFailed { tail })
+    match undo(job, &new) {
+        Ok(()) => Outcome::TestFailed { tail },
+        Err(e) => Outcome::Diverged(e),
+    }
 }
 
 /// After a restart: a brief left in `merging` means a merge may be half done. The branch may be on amm's head, or on
 /// a merge commit amm made of that head and one of the `stale` gated commits before it could record it; anything else
-/// was not amm's doing. Resets the worktree to `head`.
-fn recover(wt: &Path, branch: &str, head: &str, stale: &[String]) -> Result<(), String> {
+/// was not amm's doing. Puts the branch and the worktree back on `head`.
+fn recover(repo: &Path, wt: &Path, branch: &str, head: &str, stale: &[String]) -> Result<(), String> {
     let at = rev(wt, &format!("refs/heads/{branch}^{{commit}}")).ok_or_else(|| format!("{branch} cannot be read"))?;
     let ours = at == head || {
         let (p1, p2, p3) = (rev(wt, &format!("{at}^1")), rev(wt, &format!("{at}^2")), rev(wt, &format!("{at}^3")));
@@ -259,9 +320,11 @@ fn recover(wt: &Path, branch: &str, head: &str, stale: &[String]) -> Result<(), 
     if sym.code != 0 || sym.stdout.trim() != format!("refs/heads/{branch}") {
         return Err(format!("the integration worktree is no longer on {branch}"));
     }
-    let _ = git_checkout(wt, &["merge", "--abort"]);
-    reset_to(wt, head)?;
-    verify_at(wt, branch, head)
+    if at != head {
+        cas(wt, branch, head, &at)?;
+    }
+    reset_to(wt, &tree_of(wt, head)?, head)?;
+    verify_at(repo, wt, branch, head)
 }
 
 /// Releases a run's merge claim when dropped, panics included. `disarm` once the claim was released under the lock.
@@ -483,7 +546,7 @@ async fn queue(state: &Arc<Mutex<Amm>>, run_id: &str, claim: &mut Claim) -> Resu
         (!stale.is_empty()).then_some((v, stale, shas))
     };
     if let Some((v, stale, shas)) = stale {
-        let recovered = blocking(move || recover(&v.wt, &v.branch, &v.head, &shas)).await.and_then(|r| r);
+        let recovered = blocking(move || recover(&v.repo, &v.wt, &v.branch, &v.head, &shas)).await.and_then(|r| r);
         let mut amm = lock(state);
         match recovered {
             Ok(()) => {
@@ -508,6 +571,7 @@ async fn queue(state: &Arc<Mutex<Amm>>, run_id: &str, claim: &mut Claim) -> Resu
                 return amm.finish_run(run_id).map_err(|e| e.0);
             };
             let job = Job {
+                repo: v.repo.clone(),
                 wt: v.wt.clone(),
                 branch: v.branch.clone(),
                 head: v.head.clone(),
@@ -519,7 +583,7 @@ async fn queue(state: &Arc<Mutex<Amm>>, run_id: &str, claim: &mut Claim) -> Resu
             };
             (job, v, b, w)
         };
-        let undo = job.clone();
+        let undo_job = job.clone();
         let outcome = blocking(move || merge_one(&job)).await.unwrap_or_else(Outcome::Error);
         let kept = lock(state).record(run_id, &b, &w, &outcome).map_err(|e| e.0);
         match (&outcome, kept) {
@@ -535,10 +599,11 @@ async fn queue(state: &Arc<Mutex<Amm>>, run_id: &str, claim: &mut Claim) -> Resu
                     }
                 }
             }
-            (Outcome::Merged { .. }, Ok(false)) => {
+            (Outcome::Merged { new }, Ok(false)) => {
                 // The brief was cancelled while it merged: take the merge back off the branch.
-                let undone = blocking(move || back_to(&undo, Outcome::Error(String::new()))).await;
-                if let Ok(Outcome::Diverged(e)) | Err(e) = undone {
+                let new = new.clone();
+                let undone = blocking(move || undo(&undo_job, &new)).await.and_then(|r| r);
+                if let Err(e) = undone {
                     lock(state).fail_run(run_id, &e).map_err(|e| e.0)?;
                     return Ok(());
                 }
@@ -640,7 +705,7 @@ mod tests {
 
     fn queue_with(test_cmd: &str) -> Q {
         let h = make_amm(DEFAULT_LIMITS);
-        let repo = init_repo_with(&[("src/a.ts", "a\n"), ("c.txt", "c\n")]);
+        let repo = init_repo_with(&[("src/a.ts", "a\n"), ("c.txt", "1\n2\n3\n4\n5\n")]);
         let id = new_run_id();
         let (iwt, head) = create_worktree(&repo, &id, "main").unwrap();
         let mut amm = h.amm;
@@ -663,10 +728,13 @@ mod tests {
             lock(&self.state)
         }
         fn add(&self, title: &str, scope: &str) -> Brief {
+            self.add_scoped(title, &[scope])
+        }
+        fn add_scoped(&self, title: &str, scope: &[&str]) -> Brief {
             let input = BriefInput {
                 title: title.into(),
                 goal: "g".into(),
-                scope: vec![scope.into()],
+                scope: scope.iter().map(|s| s.to_string()).collect(),
                 checks: vec![],
                 tier: Tier::Light,
                 max_turns: None,
@@ -880,6 +948,55 @@ mod tests {
         q.integrate().await;
         assert_eq!(q.brief(&b.id).state, BriefState::Merging);
         assert_eq!((q.fresh_run().integration_head, q.fresh_run().merges), (head, 0));
+    }
+
+    #[tokio::test]
+    async fn a_merge_driver_named_in_a_gated_commit_never_runs() {
+        let q = queue_with("true");
+        let marker = tmp_dir().join("ran");
+        sh(&q.repo, &["config", "merge.x.driver", &format!("touch {}; false", marker.display())]);
+        let (b1, b2) = (q.add("one", "c.txt"), q.add_scoped("two", &["c.txt", ".gitattributes"]));
+        q.run_worker(&b1, |wt| write(wt, "c.txt", "one\n2\n3\n4\n5\n"));
+        q.run_worker(&b2, |wt| {
+            write(wt, ".gitattributes", "c.txt merge=x\n");
+            write(wt, "c.txt", "1\n2\n3\n4\ntwo\n");
+        });
+        q.integrate().await;
+        assert!(!marker.exists(), "the merge driver from the gated commit ran");
+        assert_eq!(q.brief(&b2.id).state, BriefState::Merged);
+        assert_eq!(sh(&q.repo, &["show", &format!("{}:c.txt", q.run.integration_branch)]), "one\n2\n3\n4\ntwo");
+    }
+
+    #[tokio::test]
+    async fn tests_that_detach_head_fail_the_run_closed() {
+        let q = queue_with("git checkout -q --detach");
+        let b = q.add("one", "a/**");
+        let before = q.tip();
+        q.run_worker(&b, |wt| write(wt, "a/x.ts", "1\n"));
+        q.integrate().await;
+        assert_eq!(q.fresh_run().state, RunState::Failed);
+        assert_eq!(q.tip(), before, "amm's merge must come back off the branch");
+        assert_eq!(q.fresh_run().integration_head, Some(before));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancel_during_the_merge_takes_the_merge_back_off() {
+        let q = queue_with("sleep 1");
+        let b = q.add("one", "a/**");
+        let before = q.tip();
+        q.run_worker(&b, |wt| write(wt, "a/x.ts", "1\n"));
+        let task = tokio::spawn(integrate(q.state.clone(), q.run.id.clone()));
+        while q.brief(&b.id).state != BriefState::Merging {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        q.amm().cancel(&b.id).unwrap();
+        task.await.unwrap();
+        assert_eq!(q.brief(&b.id).state, BriefState::Cancelled);
+        assert_eq!(q.tip(), before);
+        assert_eq!(q.fresh_run().integration_head, Some(before));
+        assert!(!q.iwt.join("a/x.ts").exists());
+        assert_eq!(q.fresh_run().state, RunState::Active);
     }
 
     #[test]

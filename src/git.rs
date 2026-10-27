@@ -226,12 +226,49 @@ fn config_env(root: &Path, extra: &[(String, String)], checkout: bool) -> Result
     Ok(env)
 }
 
-/// `git` for amm's own working-tree operations in the integration worktree (reset, merge, clean): on top of the
-/// hardening `git` always has, it runs no filter (clean, smudge, process), no custom merge driver, no signing or
-/// signature check and no automatic gc, and commits as `amm <amm@localhost>`. Blocking.
-pub fn git_checkout(root: &Path, args: &[&str]) -> Result<GitResult, String> {
+/// Whether a `git --version` line names git 2.40 or newer, the first with `--attr-source`.
+fn supports_attr_source(version: &str) -> bool {
+    let Some(v) = version.strip_prefix("git version ") else { return false };
+    let mut parts = v.split(|c: char| !c.is_ascii_digit()).map(|p| p.parse::<u32>());
+    match (parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => (major, minor) >= (2, 40),
+        _ => false,
+    }
+}
+
+/// Errs unless the installed git has `--attr-source`; checked once.
+fn require_attr_source() -> Result<(), String> {
+    static OK: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    OK.get_or_init(|| {
+        let v = git(Path::new("/"), &["--version"])?;
+        if supports_attr_source(v.stdout.trim()) {
+            Ok(())
+        } else {
+            Err(format!("amm needs git 2.40 or newer for its integration worktree (found: {})", v.stdout.trim()))
+        }
+    })
+    .clone()
+}
+
+/// `git` for amm's own operations on the integration worktree (worktree add, merge-tree, reset, clean, status): on
+/// top of the hardening `git` always has, attributes come only from `attr_tree` (`--attr-source`, no
+/// core.attributesFile, no system file; a non-empty `info/attributes` is refused), so a worker's .gitattributes in a
+/// worktree or a gated commit selects no driver. Known filter and merge drivers are neutralised too, and there is no
+/// signing, signature check or automatic gc; commits are `amm <amm@localhost>`. Blocking. Errors if git is older
+/// than 2.40.
+pub fn git_checkout(root: &Path, attr_tree: &str, args: &[&str]) -> Result<GitResult, String> {
+    require_attr_source()?;
+    let common = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    if common.code != 0 {
+        return Err(format!("git rev-parse failed: {}", common.stderr.trim()));
+    }
+    let info = Path::new(common.stdout.trim()).join("info").join("attributes");
+    if std::fs::metadata(&info).is_ok_and(|m| m.len() > 0) {
+        return Err(format!("{} is not empty; amm refuses repository-wide attributes", info.display()));
+    }
     let (name, email) = AMM_IDENT;
     let extra: Vec<(String, String)> = [
+        ("core.attributesFile", "/dev/null"),
         ("commit.gpgsign", "false"),
         ("merge.verifySignatures", "false"),
         ("gc.auto", "0"),
@@ -249,7 +286,9 @@ pub fn git_checkout(root: &Path, args: &[&str]) -> Result<GitResult, String> {
         env.push((format!("GIT_{who}_NAME"), name.into()));
         env.push((format!("GIT_{who}_EMAIL"), email.into()));
     }
-    run(root, args, &env, MAX_OUTPUT, GIT_TIMEOUT)
+    let source = format!("--attr-source={attr_tree}");
+    let full: Vec<&str> = std::iter::once(source.as_str()).chain(args.iter().copied()).collect();
+    run(root, &full, &env, MAX_OUTPUT, GIT_TIMEOUT)
 }
 
 /// Files that differ from `base_sha`, relative to the worktree root `root`: changes committed in `base_sha..sha`,
@@ -778,6 +817,31 @@ mod tests {
     }
 
     #[test]
+    fn git_checkout_reads_attributes_only_from_the_trusted_tree() {
+        let dir = repo();
+        let tree = git(&dir, &["rev-parse", "HEAD^{tree}"]).unwrap().stdout.trim().to_string();
+        // Worktree, global and info attributes a worker could plant.
+        fs::write(dir.join(".gitattributes"), "a.txt merge=x\n").unwrap();
+        let global = tmp_dir().join("attrs");
+        fs::write(&global, "a.txt diff=y\n").unwrap();
+        git_in(&dir, &["config", "core.attributesFile", global.to_str().unwrap()]);
+        let attrs = git_checkout(&dir, &tree, &["check-attr", "merge", "diff", "--", "a.txt"]).unwrap().stdout;
+        assert_eq!(attrs, "a.txt: merge: unspecified\na.txt: diff: unspecified\n");
+        fs::create_dir_all(dir.join(".git/info")).unwrap();
+        fs::write(dir.join(".git/info/attributes"), "* merge=x\n").unwrap();
+        assert!(git_checkout(&dir, &tree, &["status"]).unwrap_err().contains("info/attributes"));
+    }
+
+    #[test]
+    fn attr_source_needs_git_2_40() {
+        assert!(supports_attr_source("git version 2.40.0"));
+        assert!(supports_attr_source("git version 2.56.0"));
+        assert!(supports_attr_source("git version 3.0.1 (Apple Git-1)"));
+        assert!(!supports_attr_source("git version 2.39.5"));
+        assert!(!supports_attr_source("nonsense"));
+    }
+
+    #[test]
     fn git_checkout_runs_no_smudge_filter_or_merge_driver() {
         let dir = repo();
         let marker = tmp_dir().join("ran");
@@ -795,10 +859,12 @@ mod tests {
         git_in(&dir, &["config", "filter.x.smudge", &touch]);
         git_in(&dir, &["config", "filter.x.clean", &touch]);
         git_in(&dir, &["config", "merge.m.driver", &format!("touch {}; true", marker.display())]);
-        let m = git_checkout(&dir, &["merge", "--no-edit", "side"]).unwrap();
+        // Even with the planted attributes as the trusted tree, the drivers stay neutralised.
+        let tree = git(&dir, &["rev-parse", "HEAD^{tree}"]).unwrap().stdout.trim().to_string();
+        let m = git_checkout(&dir, &tree, &["merge", "--no-edit", "side"]).unwrap();
         assert_ne!(m.code, 0, "the neutralised driver makes the file conflict");
-        git_checkout(&dir, &["merge", "--abort"]).unwrap();
-        git_checkout(&dir, &["reset", "-q", "--hard", &base]).unwrap();
+        git_checkout(&dir, &tree, &["merge", "--abort"]).unwrap();
+        git_checkout(&dir, &tree, &["reset", "-q", "--hard", &base]).unwrap();
         assert!(!marker.exists(), "a planted smudge filter or merge driver ran");
     }
 
