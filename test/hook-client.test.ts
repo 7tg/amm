@@ -17,7 +17,7 @@ test('without a daemon lock the client exits silently', () => {
 
 test('main-session events for non-amm tools are not forwarded', () => {
   const home = tmpDir();
-  fs.writeFileSync(path.join(home, 'daemon.lock'), JSON.stringify({ pid: 1, port: 1, token: 'x' }));
+  fs.writeFileSync(path.join(home, 'daemon.lock'), JSON.stringify({ pid: process.pid, port: 1, token: 'x' }));
   const r = run(home, 'PreToolUse', { session_id: 's', tool_name: 'Read' });
   assert.deepEqual([r.status, r.stdout], [0, '']);
   assert.equal(fs.existsSync(path.join(home, 'hook-fallback.log')), false);
@@ -47,8 +47,16 @@ test('worker events are forwarded and the decision printed', async () => {
 
 test('an unreachable daemon is logged and the action allowed', () => {
   const home = tmpDir();
-  fs.writeFileSync(path.join(home, 'daemon.lock'), JSON.stringify({ pid: 1, port: 1, token: 'x' }));
+  fs.writeFileSync(path.join(home, 'daemon.lock'), JSON.stringify({ pid: process.pid, port: 1, token: 'x' }));
   const r = run(home, 'PreToolUse', { agent_id: 'a', tool_name: 'Read' });
   assert.deepEqual([r.status, r.stdout], [0, '']);
   assert.match(fs.readFileSync(path.join(home, 'hook-fallback.log'), 'utf8'), /PreToolUse/);
+});
+
+test('a stale lock with a dead pid sends nothing and logs nothing', () => {
+  const home = tmpDir();
+  fs.writeFileSync(path.join(home, 'daemon.lock'), JSON.stringify({ pid: 2 ** 22 + 12345, port: 1, token: 'x' }));
+  const r = run(home, 'PreToolUse', { agent_id: 'a', tool_name: 'Read' });
+  assert.deepEqual([r.status, r.stdout], [0, '']);
+  assert.equal(fs.existsSync(path.join(home, 'hook-fallback.log')), false);
 });
