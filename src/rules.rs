@@ -27,9 +27,13 @@ pub enum Verdict {
 #[derive(Debug, Clone)]
 pub struct RuleContext {
     pub limits: Limits,
+    pub no_progress: i64,
     pub max_turns: i64,
     pub checks: Vec<String>,
 }
+
+/// Extra calls a worker gets before its first edit or passing check.
+pub const WARMUP_CALLS: i64 = 6;
 
 pub fn is_edit_tool(tool: &str) -> bool {
     matches!(tool, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
@@ -43,7 +47,7 @@ pub fn message_for(rule: &str, ctx: &RuleContext) -> String {
         ),
         "no-progress" => format!(
             "amm watchdog: {} tool calls without changing a file or passing a check. Re-read your brief and make the change, or report \"blocked\".",
-            ctx.limits.no_progress_calls
+            ctx.no_progress
         ),
         "budget" => format!(
             "amm watchdog: you have used {}% of your tool budget. Finish the current change, run your checks, call amm_report and stop.",
@@ -103,7 +107,9 @@ pub fn evaluate(c: &Counters, e: &ToolEvent, ctx: &RuleContext) -> (Counters, Ve
         next.last_cmd_fails = 0;
         return fire(next, "repeat-failure", ctx);
     }
-    if next.since_progress >= ctx.limits.no_progress_calls {
+    let warming_up = next.since_progress == next.tool_calls;
+    let threshold = ctx.no_progress + if warming_up { WARMUP_CALLS } else { 0 };
+    if next.since_progress >= threshold {
         next.since_progress = 0;
         return fire(next, "no-progress", ctx);
     }
@@ -126,16 +132,24 @@ mod tests {
         Counters { tool_calls: 0, since_progress: 0, last_cmd: None, last_cmd_fails: 0, fired_rules: vec![] }
     }
 
+    /// A worker that has already made progress once, so the warm-up no longer applies.
+    fn started() -> Counters {
+        Counters { tool_calls: 1, ..fresh() }
+    }
+
     fn ctx() -> RuleContext {
-        RuleContext { limits: DEFAULT_LIMITS, max_turns: 100, checks: vec!["npm test".to_string()] }
+        RuleContext { limits: DEFAULT_LIMITS, no_progress: 8, max_turns: 100, checks: vec!["npm test".to_string()] }
     }
 
     fn feed(events: Vec<ToolEvent>, start: Counters) -> (Counters, Vec<Verdict>) {
-        let ctx = ctx();
+        feed_with(events, start, &ctx())
+    }
+
+    fn feed_with(events: Vec<ToolEvent>, start: Counters, ctx: &RuleContext) -> (Counters, Vec<Verdict>) {
         let mut c = start;
         let mut verdicts = vec![];
         for e in &events {
-            let (next, v) = evaluate(&c, e, &ctx);
+            let (next, v) = evaluate(&c, e, ctx);
             c = next;
             verdicts.push(v);
         }
@@ -181,7 +195,7 @@ mod tests {
 
     #[test]
     fn eight_calls_without_an_edit_or_passing_check_is_no_progress() {
-        let (_, v) = feed(reads(8), fresh());
+        let (_, v) = feed(reads(8), started());
         assert!(matches!(v.last().unwrap(), Verdict::Correct { .. }));
         assert_eq!(rule_of(v.last().unwrap()), "no-progress");
     }
@@ -222,7 +236,7 @@ mod tests {
         let mut ev = reads(8);
         ev.push(edit());
         ev.extend(reads(8));
-        let (_, v) = feed(ev, fresh());
+        let (_, v) = feed(ev, started());
         let corrects = v.iter().filter(|v| matches!(v, Verdict::Correct { .. })).count();
         assert_eq!(corrects, 2);
         assert!(!v.iter().any(|v| matches!(v, Verdict::Escalate { .. })));
@@ -230,7 +244,7 @@ mod tests {
 
     #[test]
     fn no_progress_escalates_when_it_fires_again_without_recovery() {
-        let (_, v) = feed(reads(16), fresh());
+        let (_, v) = feed(reads(16), started());
         assert_eq!(v.last().unwrap(), &Verdict::Escalate { rule: "no-progress".into() });
     }
 
@@ -239,7 +253,7 @@ mod tests {
         let failed_edit = ToolEvent { tool: "Edit".into(), input: json!({ "file_path": "a" }), failed: true };
         let mut ev = reads(7);
         ev.push(failed_edit);
-        let (_, v) = feed(ev, fresh());
+        let (_, v) = feed(ev, started());
         assert_eq!(rule_of(v.last().unwrap()), "no-progress");
     }
 
@@ -255,5 +269,35 @@ mod tests {
         let (c, _) = feed(vec![bash("make", true), bash("make", true), bash("make", true), bash("lint", true)], fresh());
         let (_, again) = feed(vec![bash("make", true), bash("make", true), bash("make", true)], c);
         assert!(matches!(again.last().unwrap(), Verdict::Correct { .. }));
+    }
+
+    fn after_edit(n: usize) -> Vec<ToolEvent> {
+        let mut ev = vec![edit()];
+        ev.extend(reads(n));
+        ev
+    }
+
+    #[test]
+    fn light_worker_is_corrected_after_8_reads_following_an_edit() {
+        let (_, v) = feed(after_edit(8), fresh());
+        assert_eq!(rule_of(v.last().unwrap()), "no-progress");
+        assert!(v[..v.len() - 1].iter().all(is_ok));
+    }
+
+    #[test]
+    fn heavy_worker_is_corrected_after_20_reads_following_an_edit_but_not_19() {
+        let heavy = RuleContext { no_progress: 20, ..ctx() };
+        let (_, v) = feed_with(after_edit(19), fresh(), &heavy);
+        assert!(v.iter().all(is_ok));
+        let (_, v) = feed_with(after_edit(20), fresh(), &heavy);
+        assert_eq!(rule_of(v.last().unwrap()), "no-progress");
+    }
+
+    #[test]
+    fn fresh_worker_gets_a_warm_up_before_its_first_edit() {
+        let (_, v) = feed(reads(13), fresh());
+        assert!(v.iter().all(is_ok));
+        let (_, v) = feed(reads(14), fresh());
+        assert_eq!(rule_of(v.last().unwrap()), "no-progress");
     }
 }

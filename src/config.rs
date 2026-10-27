@@ -13,6 +13,15 @@ pub fn tier_max_turns(tier: Tier) -> i64 {
     }
 }
 
+/// Tool calls without progress before a worker is corrected; heavier tiers map more code first.
+pub fn no_progress_limit(limits: &Limits, tier: Tier) -> i64 {
+    match tier {
+        Tier::Light => limits.no_progress_calls,
+        Tier::Standard => limits.no_progress_calls + 4,
+        Tier::Heavy => limits.no_progress_calls + 12,
+    }
+}
+
 pub fn tier_name(tier: Tier) -> &'static str {
     match tier {
         Tier::Light => "light",
