@@ -10,13 +10,16 @@ export class Semaphores {
   tryAcquire(name: string, holder: string, capacity: number, leaseMs: number): boolean {
     const h = this.held.get(name) ?? new Map<string, number>();
     this.held.set(name, h);
-    if (!h.has(holder) && h.size >= capacity) return false;
-    h.set(holder, this.now() + leaseMs);
+    const now = this.now();
+    const live = [...h].filter(([k, until]) => k !== holder && until > now).length;
+    if (live >= capacity) return false;
+    h.set(holder, now + leaseMs);
     return true;
   }
 
   renew(holder: string, leaseMs: number): void {
-    for (const h of this.held.values()) if (h.has(holder)) h.set(holder, this.now() + leaseMs);
+    const now = this.now();
+    for (const h of this.held.values()) if ((h.get(holder) ?? 0) > now) h.set(holder, now + leaseMs);
   }
 
   release(holder: string): void {

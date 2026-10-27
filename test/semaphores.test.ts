@@ -36,3 +36,22 @@ test('expire removes holders whose lease ran out; renew extends it', () => {
   assert.deepEqual(s.expire(), ['w1']);
   assert.deepEqual(s.holders('workers'), ['w2']);
 });
+
+test('expired holders do not count toward capacity but are still reported by expire', () => {
+  const c = clock();
+  const s = new Semaphores(c.now);
+  assert.equal(s.tryAcquire('workers', 'w1', 1, 100), true);
+  c.advance(100);
+  assert.equal(s.tryAcquire('workers', 'w2', 1, 100), true);
+  assert.deepEqual(s.expire(), ['w1']);
+  assert.deepEqual(s.holders('workers'), ['w2']);
+});
+
+test('renew does not revive an expired lease', () => {
+  const c = clock();
+  const s = new Semaphores(c.now);
+  s.tryAcquire('workers', 'w1', 1, 100);
+  c.advance(100);
+  s.renew('w1', 100);
+  assert.deepEqual(s.expire(), ['w1']);
+});
