@@ -1,0 +1,278 @@
+[
+ {
+  "name": "amm_run_start",
+  "description": "Start an amm run. Returns run_id.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "repo": {
+     "type": "string",
+     "description": "Absolute path of the repository (the main session cwd)"
+    },
+    "test_cmd": {
+     "type": "string",
+     "description": "Full test command for the repo"
+    },
+    "base_branch": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "repo",
+    "test_cmd"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+ },
+ {
+  "name": "amm_brief_add",
+  "description": "Add a brief (one isolated unit of work for one worker). Returns brief_id.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "run_id": {
+     "type": "string"
+    },
+    "title": {
+     "type": "string"
+    },
+    "goal": {
+     "type": "string",
+     "description": "What to do and why, self-contained"
+    },
+    "scope": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "Globs relative to repo root the worker may change"
+    },
+    "checks": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "Commands that must pass for the brief to be done"
+    },
+    "tier": {
+     "type": "string",
+     "enum": [
+      "light",
+      "standard",
+      "heavy"
+     ]
+    },
+    "max_turns": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "run_id",
+    "title",
+    "goal",
+    "scope",
+    "checks",
+    "tier"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+ },
+ {
+  "name": "amm_plan_import",
+  "description": "Import \"### Task N:\" sections of a plan file as draft briefs. Returns id, title, scope per brief.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "run_id": {
+     "type": "string"
+    },
+    "path": {
+     "type": "string",
+     "description": "Absolute path of the plan markdown file"
+    }
+   },
+   "required": [
+    "run_id",
+    "path"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+ },
+ {
+  "name": "amm_brief_update",
+  "description": "Change a draft/queued/blocked/failed brief. Pass ready=true to queue it.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "brief_id": {
+     "type": "string"
+    },
+    "title": {
+     "type": "string"
+    },
+    "goal": {
+     "type": "string"
+    },
+    "scope": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "checks": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "tier": {
+     "type": "string",
+     "enum": [
+      "light",
+      "standard",
+      "heavy"
+     ]
+    },
+    "max_turns": {
+     "type": "integer"
+    },
+    "ready": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "brief_id"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+ },
+ {
+  "name": "amm_dispatch",
+  "description": "Reserve worker slots for queued briefs. Returns the exact Agent calls to make (run each with run_in_background: true).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "run_id": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "run_id"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+ },
+ {
+  "name": "amm_brief_get",
+  "description": "Worker only: fetch your brief by token.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "token": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "token"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+ },
+ {
+  "name": "amm_report",
+  "description": "Worker only: report the result of your brief before finishing.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "token": {
+     "type": "string"
+    },
+    "status": {
+     "type": "string",
+     "enum": [
+      "done",
+      "blocked"
+     ]
+    },
+    "files": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "notes": {
+     "type": "string",
+     "description": "At most a few lines"
+    }
+   },
+   "required": [
+    "token",
+    "status"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+ },
+ {
+  "name": "amm_status",
+  "description": "Compact run status: counts plus only what changed since the last call. full=true lists every brief.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "run_id": {
+     "type": "string"
+    },
+    "full": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+ },
+ {
+  "name": "amm_nudge",
+  "description": "Send a correction to the worker of a brief; delivered on its next tool call.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "brief_id": {
+     "type": "string"
+    },
+    "message": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "brief_id",
+    "message"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+ },
+ {
+  "name": "amm_cancel",
+  "description": "Cancel a brief, or all unfinished briefs of a run.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string",
+     "description": "brief id or run id"
+    }
+   },
+   "required": [
+    "id"
+   ],
+   "additionalProperties": false,
+   "$schema": "http://json-schema.org/draft-07/schema#"
+  }
+ }
+]

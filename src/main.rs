@@ -15,18 +15,34 @@ enum Command {
     Daemon,
     /// Run the MCP stdio shim
     Shim,
-    /// Handle a Claude Code hook event
-    Hook { event: String },
+    /// Handle a Claude Code hook event (stdin: the hook payload)
+    Hook { event: Option<String> },
 }
 
 fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::Daemon => std::process::exit(daemon()),
-        Command::Shim => eprintln!("amm shim: not implemented"),
-        Command::Hook { event } => eprintln!("amm hook {event}: not implemented"),
+        Command::Shim => std::process::exit(shim()),
+        Command::Hook { event } => std::process::exit(amm::hook_client::run_hook(event.as_deref())),
     }
-    std::process::exit(2);
+}
+
+fn shim() -> i32 {
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("amm: {e}");
+            return 1;
+        }
+    };
+    match rt.block_on(amm::shim::run_shim()) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("amm shim: {e}");
+            1
+        }
+    }
 }
 
 fn daemon() -> i32 {
