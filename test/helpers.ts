@@ -36,3 +36,10 @@ export function initRepo(files: Record<string, string> = { 'README.md': 'hi\n' }
   git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
   return fs.realpathSync(dir);
 }
+
+/** A real git worktree of `repo` on branch worktree-agent-X, like Claude Code creates for subagents. */
+export function addWorktree(repo: string, name = `x${Math.random().toString(16).slice(2, 8)}`): string {
+  const dir = path.join(repo, '.claude', 'worktrees', `agent-${name}`);
+  execFileSync('git', ['worktree', 'add', '-q', '-b', `worktree-agent-${name}`, dir], { cwd: repo, stdio: 'pipe' });
+  return fs.realpathSync(dir);
+}

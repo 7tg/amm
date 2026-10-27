@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { runCheck, runChecks } from '../src/checks.ts';
-import { changedFiles, git } from '../src/git.ts';
+import { addWorktree } from './helpers.ts';
+import { changedFiles, git, worktreeInfo } from '../src/git.ts';
 
 function repo(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amm-git-'));
@@ -105,4 +106,24 @@ test('runCheck truncates output to the last 4000 chars', async () => {
   const r = await runCheck('head -c 9000 /dev/zero | tr "\\0" a; echo END', os.tmpdir(), 5_000);
   assert.equal(r.output.length, 4000);
   assert.match(r.output, /END\n$/);
+});
+
+test('changedFiles still lists a committed out-of-scope change after a working-tree revert', async () => {
+  const dir = repo();
+  const base = (await git(dir, ['rev-parse', 'HEAD'])).stdout.trim();
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'evil\n');
+  gitIn(dir, 'commit', '-qam', 'evil');
+  gitIn(dir, 'revert', '--no-commit', 'HEAD');
+  assert.deepEqual(await changedFiles(dir, base), ['a.txt']);
+});
+
+test('worktreeInfo describes a worktree', async () => {
+  const main = repo();
+  const wt = addWorktree(main, 'q');
+  const info = await worktreeInfo(wt);
+  assert.equal(info.toplevel, wt);
+  assert.equal(info.commonDir, fs.realpathSync(path.join(main, '.git')));
+  assert.equal(info.branch, 'worktree-agent-q');
+  assert.match(info.head, /^[0-9a-f]{40}$/);
+  assert.equal((await worktreeInfo(main)).toplevel, fs.realpathSync(main));
 });
