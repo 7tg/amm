@@ -46,13 +46,14 @@ export function runCheck(cmd: string, cwd: string, timeoutMs: number): Promise<C
       killGroup();
     }, timeoutMs);
     let exitCode: number | null = null;
+    let graceTimer: NodeJS.Timeout | undefined;
     const done = () => finish({ cmd, ok: exitCode === 0 && !timedOut, code: exitCode, timedOut, output });
     child.on('exit', (code) => {
       exited = true;
       exitCode = code;
       killGroup();
       // grandchildren may hold the pipes open; give 'close' a moment, then stop waiting
-      setTimeout(() => {
+      graceTimer = setTimeout(() => {
         child.stdout.destroy();
         child.stderr.destroy();
         done();
@@ -60,6 +61,7 @@ export function runCheck(cmd: string, cwd: string, timeoutMs: number): Promise<C
     });
     child.on('close', (code) => {
       exitCode = code;
+      if (graceTimer) clearTimeout(graceTimer);
       done();
     });
   });

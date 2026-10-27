@@ -53,3 +53,16 @@ test('events respects limit and clamps it to at least 1', () => {
   assert.equal(s.events({ limit: 0 }).length, 1);
   s.close();
 });
+
+test('get and all return copies; mutating them does not change the store', () => {
+  const file = dbFile();
+  const s = new Store(file);
+  s.put('sessions', { id: 's1', cwd: '/a', firstSeen: 1, lastSeen: 1 });
+  s.get('sessions', 's1')!.cwd = 'x';
+  s.all('sessions')[0].cwd = 'y';
+  assert.equal(s.get('sessions', 's1')?.cwd, '/a');
+  s.close();
+  const s2 = new Store(file);
+  assert.equal(s2.get('sessions', 's1')?.cwd, '/a');
+  s2.close();
+});

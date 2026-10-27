@@ -36,7 +36,9 @@ test('runCheck reports exit code and output tail', async () => {
 });
 
 test('runCheck kills commands that exceed the timeout', async () => {
+  const t = Date.now();
   const r = await runCheck('sleep 5; echo x', os.tmpdir(), 200);
+  assert.ok(Date.now() - t < 1500);
   assert.deepEqual([r.ok, r.timedOut], [false, true]);
 });
 
@@ -76,9 +78,18 @@ test('changedFiles throws on a bad base sha', async () => {
   await assert.rejects(changedFiles(dir, 'deadbeef'), /deadbeef|unknown|bad/i);
 });
 
-test('runCheck does not wait for background grandchildren', async () => {
+const hasSetsid = (() => {
+  try {
+    execFileSync('sh', ['-c', 'command -v setsid'], { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+test('runCheck does not wait for background grandchildren', { skip: !hasSetsid }, async () => {
   const t = Date.now();
-  const r = await runCheck('(sleep 2 &) ; echo hi', os.tmpdir(), 5_000);
+  const r = await runCheck('setsid sleep 2 & echo hi', os.tmpdir(), 5_000);
   assert.equal(r.ok, true);
   assert.match(r.output, /hi/);
   assert.ok(Date.now() - t < 1000);

@@ -49,11 +49,12 @@ export class Store {
   }
 
   get<T extends Table>(t: T, id: string): Docs[T] | undefined {
-    return (this.cache[t] as Map<string, Docs[T]>).get(id);
+    const d = (this.cache[t] as Map<string, Docs[T]>).get(id);
+    return d === undefined ? undefined : structuredClone(d);
   }
 
   all<T extends Table>(t: T): Docs[T][] {
-    return [...(this.cache[t] as Map<string, Docs[T]>).values()];
+    return [...(this.cache[t] as Map<string, Docs[T]>).values()].map((d) => structuredClone(d));
   }
 
   put<T extends Table>(t: T, doc: Docs[T]): void {
