@@ -393,6 +393,8 @@ pub fn commit_all(root: &Path, branch: &str, parent: &str, message: &str) -> Res
         Ok(r.stdout)
     };
     let parent_tree = g(&["rev-parse", "--verify", "--end-of-options", &format!("{parent}^{{tree}}")], None)?.trim().to_string();
+    // The null id that deletes an index entry is as long as the repository's hashes (sha1 or sha256).
+    let null = "0".repeat(parent_tree.len());
     g(&["read-tree", "--end-of-options", parent], None)?;
     let listing = g(&["ls-tree", "-r", "-z", "--full-tree", "--end-of-options", parent], None)?;
     let mut paths: Vec<String> = Vec::new();
@@ -423,8 +425,8 @@ pub fn commit_all(root: &Path, branch: &str, parent: &str, message: &str) -> Res
                 file_modes.push(if m.permissions().mode() & 0o100 != 0 { "100755" } else { "100644" });
             }
             // Gone, or replaced by a directory (whose files are listed on their own): the path is deleted.
-            Ok(m) if m.file_type().is_dir() => entry("0", &"0".repeat(40), path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => entry("0", &"0".repeat(40), path),
+            Ok(m) if m.file_type().is_dir() => entry("0", &null, path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => entry("0", &null, path),
             Ok(_) => return Err(format!("{path} is not a regular file, symlink or directory")),
             Err(e) => return Err(format!("{path}: {e}")),
         }
@@ -763,6 +765,21 @@ mod tests {
         let files = git(&dir, &["diff", "--name-only", &base, &sha]).unwrap().stdout;
         assert_eq!(sorted(files.lines().map(str::to_string).collect()), ["a.txt", "ita.txt"]);
         assert_eq!(git(&dir, &["show", &format!("{sha}:a.txt")]).unwrap().stdout, "hidden change\n");
+    }
+
+    #[test]
+    fn commit_all_commits_a_deletion_in_a_sha256_repository() {
+        let dir = tmp_dir();
+        git_in(&dir, &["init", "-q", "-b", "main", "--object-format=sha256"]);
+        fs::write(dir.join("a.txt"), "a\n").unwrap();
+        fs::write(dir.join("b.txt"), "b\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-qm", "init"]);
+        let base = head(&dir);
+        assert_eq!(base.len(), 64);
+        fs::remove_file(dir.join("b.txt")).unwrap();
+        let sha = commit_all(&dir, "main", &base, "m").unwrap();
+        assert_eq!(git(&dir, &["diff", "--name-only", &base, &sha]).unwrap().stdout.trim(), "b.txt");
     }
 
     #[test]

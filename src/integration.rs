@@ -486,12 +486,15 @@ impl Amm {
             }
             Outcome::Conflict { files } => {
                 let note = format!("{CONFLICT_NOTE}: {}", files.join(", "));
-                self.brief_transition(&b.id, &[BriefState::Merging], |x| {
+                let moved = self.brief_transition(&b.id, &[BriefState::Merging], |x| {
                     x.state = BriefState::Queued;
                     x.attempt += 1;
                     x.report = None;
                     x.notes.push(note);
                 })?;
+                if moved.is_none() {
+                    return Ok(false);
+                }
                 self.event("conflict", Some(run_id), Some(&w.id), json!({ "briefId": b.id, "files": files }))?;
                 Ok(false)
             }
@@ -525,10 +528,13 @@ impl Amm {
                     "merging your work would change files outside your scope: {}. amm refused the merge",
                     files.join(", ")
                 );
-                self.brief_transition(&b.id, &[BriefState::Merging], |x| {
+                let moved = self.brief_transition(&b.id, &[BriefState::Merging], |x| {
                     x.state = BriefState::Failed;
                     x.notes.push(note);
                 })?;
+                if moved.is_none() {
+                    return Ok(false);
+                }
                 self.event("scope_violation", Some(run_id), Some(&w.id), json!({ "briefId": b.id, "files": files }))?;
                 Ok(false)
             }
@@ -1131,6 +1137,27 @@ mod tests {
         q.integrate().await;
         assert_eq!(rev(&q.repo, &format!("{}^2", q.tip())), Some(g));
         assert_eq!(rev(&q.repo, &pin), None, "the pin outlived the merge");
+    }
+
+    #[tokio::test]
+    async fn outcomes_for_a_brief_no_longer_merging_record_nothing() {
+        let q = queue_with("true");
+        let b = q.add("one", "a/**");
+        q.run_worker(&b, |wt| write(wt, "a/x.ts", "1\n"));
+        let w = q.amm().store.all::<Worker>().into_iter().find(|w| w.brief_id == b.id).unwrap();
+        // Done briefs are not cancellable; force a settled state as a cancel during the merge leaves it.
+        q.amm().brief_transition(&b.id, &[BriefState::Done], |x| x.state = BriefState::Cancelled).unwrap();
+        let before = q.amm().store.events(&Default::default()).unwrap().len();
+        for o in [
+            Outcome::Conflict { files: vec!["c.txt".into()] },
+            Outcome::ScopeViolation { files: vec!["x".into()] },
+            Outcome::TestFailed { tail: "t".into() },
+            Outcome::Error("e".into()),
+        ] {
+            assert!(!q.amm().record(&q.run.id, &b, &w, &o).unwrap());
+        }
+        assert_eq!(q.amm().store.events(&Default::default()).unwrap().len(), before);
+        assert_eq!(q.brief(&b.id).state, BriefState::Cancelled);
     }
 
     #[test]
