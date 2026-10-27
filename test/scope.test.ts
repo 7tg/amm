@@ -27,3 +27,22 @@ test('scopesOverlap is conservative on shared prefixes', () => {
   assert.equal(scopesOverlap(['src/ap*'], ['src/api.ts']), true);
   assert.equal(scopesOverlap(['**/*.md'], ['src/x.ts']), true);
 });
+
+test('globs are normalized: leading ./ and trailing /', () => {
+  assert.equal(inScope('/w/src/a.ts', '/w', ['./src/**']), true);
+  assert.equal(inScope('/w/src/a.ts', '/w', ['src/']), true);
+  assert.equal(staticPrefix('./src/a/**'), 'src/a');
+});
+
+test('extglob and other glob characters end the static prefix', () => {
+  assert.equal(staticPrefix('src/!(b).ts'), 'src');
+  assert.equal(scopesOverlap(['src/!(b).ts'], ['src/a.ts']), true);
+});
+
+test('dotfiles match recursive globs; ..name is not outside the root', () => {
+  assert.equal(inScope('/w/src/.env', '/w', ['src/**']), true);
+  assert.equal(inScope('/w/src/x/.env', '/w', ['src/**']), true);
+  assert.equal(inScope('/w/.env', '/w', ['**']), true);
+  assert.equal(inScope('/w/..env', '/w', ['**']), true);
+  assert.equal(inScope('/w/../w2/a', '/w', ['**']), false);
+});
