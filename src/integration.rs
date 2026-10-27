@@ -123,13 +123,15 @@ pub fn pin_gated(dir: &Path, brief_id: &str, sha: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Drops a brief's pin; a missing pin is fine. Blocking.
-pub fn unpin_gated(dir: &Path, brief_id: &str) -> Result<(), String> {
-    let r = git(dir, &["update-ref", "-d", "--end-of-options", &pin_ref(brief_id)])?;
-    if r.code != 0 {
-        return Err(fail("could not drop the pin", &r.stderr));
+/// Drops a brief's pin if it still holds `expected` (compare-and-delete), so a newer pin is never dropped; a missing
+/// or newer pin is fine. Blocking.
+pub fn unpin_gated(dir: &Path, brief_id: &str, expected: &str) -> Result<(), String> {
+    let pin = pin_ref(brief_id);
+    let r = git(dir, &["update-ref", "-d", "--end-of-options", &pin, expected])?;
+    if r.code == 0 || rev(dir, &pin).as_deref() != Some(expected) {
+        return Ok(());
     }
-    Ok(())
+    Err(fail("could not drop the pin", &r.stderr))
 }
 
 /// Errors after which a brief fails, and the first back-off (doubling).
@@ -693,10 +695,12 @@ async fn queue(state: &Arc<Mutex<Amm>>, run_id: &str, claim: &mut Claim) -> Resu
 /// main checkout, and only `worktree-agent-*` branches). Failures are logged: they leave clutter, not risk.
 async fn cleanup(v: &RunView, brief_id: &str, w: &Worker) {
     let (repo, iwt, brief_id) = (v.repo.clone(), v.wt.clone(), brief_id.to_string());
-    let (wt, branch) = (w.worktree.clone(), w.branch.clone());
+    let (wt, branch, gated) = (w.worktree.clone(), w.branch.clone(), w.gated_sha.clone());
     let done = blocking(move || {
         let mut errs = Vec::new();
-        if let Err(e) = unpin_gated(&repo, &brief_id) {
+        if let Some(sha) = &gated
+            && let Err(e) = unpin_gated(&repo, &brief_id, sha)
+        {
             errs.push(e);
         }
         if let (Some(wt), Some(branch)) = (wt, branch.filter(|b| b.starts_with("worktree-agent-")))
@@ -1165,6 +1169,20 @@ mod tests {
         }
         assert_eq!(q.amm().store.events(&Default::default()).unwrap().len(), before);
         assert_eq!(q.brief(&b.id).state, BriefState::Cancelled);
+    }
+
+    #[test]
+    fn unpin_never_drops_a_newer_pin() {
+        let repo = init_repo();
+        let old = rev(&repo, "HEAD").unwrap();
+        sh(&repo, &["commit", "-q", "--allow-empty", "-m", "newer"]);
+        let newer = rev(&repo, "HEAD").unwrap();
+        pin_gated(&repo, "b1", &newer).unwrap();
+        unpin_gated(&repo, "b1", &old).unwrap();
+        assert_eq!(rev(&repo, &pin_ref("b1")), Some(newer.clone()));
+        unpin_gated(&repo, "b1", &newer).unwrap();
+        assert_eq!(rev(&repo, &pin_ref("b1")), None);
+        unpin_gated(&repo, "b1", &newer).unwrap();
     }
 
     #[test]

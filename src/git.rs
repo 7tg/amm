@@ -253,9 +253,32 @@ fn require_attr_source() -> Result<(), String> {
 /// `git` for amm's own operations on the integration worktree (worktree add, merge-tree, reset, clean, status): on
 /// top of the hardening `git` always has, attributes come only from `attr_tree` (`--attr-source`, no
 /// core.attributesFile, no system file; a non-empty `info/attributes` is refused), so a worker's .gitattributes in a
-/// worktree or a gated commit selects no driver. Known filter and merge drivers are neutralised too, and there is no
+/// worktree or a gated commit selects no driver. Every filter and merge driver configured or named in `attr_tree` is
+/// neutralised too, and there is no
 /// signing, signature check or automatic gc; commits are `amm <amm@localhost>`. Blocking. Errors if git is older
 /// than 2.40.
+/// Every `merge=` and `filter=` driver name the `.gitattributes` files of `tree` mention (macros included), so they
+/// can be neutralised whether or not they are configured yet: config written after amm's scan cannot arm them.
+fn tree_drivers(root: &Path, tree: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    let files = raw(root, &["ls-tree", "-r", "-z", "--name-only", "--full-tree", "--end-of-options", tree])?;
+    let (mut merges, mut filters) = (Vec::new(), Vec::new());
+    for path in files.split('\0').filter(|p| *p == ".gitattributes" || p.ends_with("/.gitattributes")) {
+        let body = raw(root, &["cat-file", "blob", &format!("{tree}:{path}")])?;
+        for token in body.lines().flat_map(str::split_whitespace) {
+            if let Some(d) = token.strip_prefix("merge=") {
+                merges.push(d.to_string());
+            } else if let Some(d) = token.strip_prefix("filter=") {
+                filters.push(d.to_string());
+            }
+        }
+    }
+    for v in [&mut merges, &mut filters] {
+        v.sort();
+        v.dedup();
+    }
+    Ok((merges, filters))
+}
+
 pub fn git_checkout(root: &Path, attr_tree: &str, args: &[&str]) -> Result<GitResult, String> {
     require_attr_source()?;
     let common = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
@@ -267,7 +290,18 @@ pub fn git_checkout(root: &Path, attr_tree: &str, args: &[&str]) -> Result<GitRe
         return Err(format!("{} is not empty; amm refuses repository-wide attributes", info.display()));
     }
     let (name, email) = AMM_IDENT;
-    let extra: Vec<(String, String)> = [
+    let (merges, filters) = tree_drivers(root, attr_tree)?;
+    let mut extra: Vec<(String, String)> = Vec::new();
+    for d in &filters {
+        for (k, v) in [("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")] {
+            extra.push((format!("filter.{d}.{k}"), v.to_string()));
+        }
+    }
+    for d in &merges {
+        extra.push((format!("merge.{d}.driver"), "false".into()));
+        extra.push((format!("merge.{d}.recursive"), "text".into()));
+    }
+    extra.extend([
         ("core.attributesFile", "/dev/null"),
         ("commit.gpgsign", "false"),
         ("merge.verifySignatures", "false"),
@@ -277,8 +311,7 @@ pub fn git_checkout(root: &Path, attr_tree: &str, args: &[&str]) -> Result<GitRe
         ("user.email", email),
     ]
     .iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect();
+    .map(|(k, v)| (k.to_string(), v.to_string())));
     let mut env = config_env(root, &extra, true)?;
     // git-lfs is the usual smudge filter; tell it to stay out even where a filter is not reached through config.
     env.push(("GIT_LFS_SKIP_SMUDGE".into(), "1".into()));
@@ -847,6 +880,26 @@ mod tests {
         fs::create_dir_all(dir.join(".git/info")).unwrap();
         fs::write(dir.join(".git/info/attributes"), "* merge=x\n").unwrap();
         assert!(git_checkout(&dir, &tree, &["status"]).unwrap_err().contains("info/attributes"));
+    }
+
+    #[test]
+    fn drivers_named_in_the_trusted_tree_are_neutralised_even_unconfigured() {
+        let dir = repo();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join(".gitattributes"), "*.txt merge=late filter=lf\n[attr]mac merge=macro\n*.md -merge !filter\n").unwrap();
+        fs::write(dir.join("sub/.gitattributes"), "x filter=deep\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-qm", "attrs"]);
+        let tree = git(&dir, &["rev-parse", "HEAD^{tree}"]).unwrap().stdout.trim().to_string();
+        let (mut merges, mut filters) = tree_drivers(&dir, &tree).unwrap();
+        merges.sort();
+        filters.sort();
+        assert_eq!((merges, filters), (vec!["late".to_string(), "macro".into()], vec!["deep".to_string(), "lf".into()]));
+        // None of them is configured, and git_checkout still overrides each one.
+        let cfg = git_checkout(&dir, &tree, &["config", "--get", "merge.late.driver"]).unwrap().stdout;
+        assert_eq!(cfg.trim(), "false");
+        let cfg = git_checkout(&dir, &tree, &["config", "--get-all", "filter.deep.smudge"]).unwrap();
+        assert_eq!((cfg.code, cfg.stdout.as_str()), (0, "\n"));
     }
 
     #[test]
