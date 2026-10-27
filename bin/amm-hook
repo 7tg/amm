@@ -1,0 +1,43 @@
+#!/usr/bin/env node
+// Forwards a Claude Code hook payload to the amm daemon and prints its decision.
+// Never blocks the agent because of amm itself: on any failure it exits 0 with no output.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const event = process.argv[2];
+const home = process.env.AMM_HOME ?? path.join(os.homedir(), '.amm');
+
+let raw = '';
+for await (const chunk of process.stdin) raw += chunk;
+
+let lock;
+try {
+  lock = JSON.parse(fs.readFileSync(path.join(home, 'daemon.lock'), 'utf8'));
+} catch {
+  process.exit(0); // amm is not running on this machine
+}
+
+let input;
+try {
+  input = JSON.parse(raw);
+} catch {
+  process.exit(0);
+}
+
+// Only worker events, subagent lifecycle, and the main session's amm tool calls matter.
+const relevant = input.agent_id || event.startsWith('Subagent') || String(input.tool_name ?? '').includes('amm_');
+if (!relevant) process.exit(0);
+
+try {
+  const res = await fetch(`http://127.0.0.1:${lock.port}/hook/${event}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-amm-token': lock.token },
+    body: raw,
+    signal: AbortSignal.timeout(event === 'SubagentStop' ? 590_000 : 5_000),
+  });
+  const out = await res.text();
+  if (res.ok && out) process.stdout.write(out);
+} catch (e) {
+  fs.appendFileSync(path.join(home, 'hook-fallback.log'), `${new Date().toISOString()} ${event} ${e.message}\n`);
+}
