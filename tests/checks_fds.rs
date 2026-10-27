@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! Own process so no other test's fds are counted.
 use std::path::Path;
 use std::time::{Duration, Instant};

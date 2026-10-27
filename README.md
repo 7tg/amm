@@ -16,6 +16,13 @@ One daemon per machine (`~/.amm`, `127.0.0.1:7878`) holds all state in SQLite.
 claude --plugin-dir /path/to/amm
 ```
 
+amm is one Rust binary, `amm` (`daemon` | `shim` | `hook <Event>`). The plugin runs it through
+`bin/amm`, a small sh launcher. On first use, and after a version bump, the launcher fetches the
+release binary for your platform (Linux or macOS, x86_64 or arm64) into `bin/<target>/` with
+`gh release download`. The repo is private, so this needs `gh auth login`. Without `gh`, or
+without a matching release, it builds the binary with `cargo build --release` instead (Rust 1.88+).
+While the binary is missing, hooks fail open: they never block the agent.
+
 ## Use
 
 Ask the main session to delegate a goal or a plan file ("delegate this plan with amm"), or invoke
@@ -24,10 +31,13 @@ Ask the main session to delegate a goal or a plan file ("delegate this plan with
 ## Develop
 
 ```bash
-npm install
-npm test
-npm run build   # regenerates dist/amm.js, which is committed
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --release   # target/release/amm; copy it to bin/<target>/amm, or let bin/amm do it
 ```
+
+Keep the version in `Cargo.toml` equal to the one in `.claude-plugin/plugin.json` (a test checks
+this). Pushing a `v<version>` tag publishes the release binaries.
 
 ## Limits
 
