@@ -89,7 +89,7 @@ async fn daemon_serves_health_rejects_bad_tokens_and_runs_api_ops() {
     assert!(healthy(Some(lock.clone())).await);
     assert_eq!(request(d.port(), "POST", "/api/status", None, "{}").await.status, 401);
     let c = Client::of(&home);
-    let run = c.call("run_start", json!({ "repo": home, "test_cmd": "true", "base_branch": "main" })).await;
+    let run = c.call("run_start", json!({ "repo": common::init_repo(), "test_cmd": "true", "base_branch": "main" })).await;
     let id = run.body["result"]["run_id"].as_str().unwrap().to_string();
     assert!(regex::Regex::new(r"^r[0-9a-f]{6}$").unwrap().is_match(&id), "{id}");
     let bad = c.call("dispatch", json!({ "run_id": "nope" })).await;
@@ -342,7 +342,7 @@ async fn plan_import_refuses_files_over_5mb() {
     let home = common::tmp_dir();
     let d = start(&home).await;
     let c = Client::of(&home);
-    let r = c.call("run_start", json!({ "repo": home, "test_cmd": "true", "base_branch": "main" })).await;
+    let r = c.call("run_start", json!({ "repo": common::init_repo(), "test_cmd": "true", "base_branch": "main" })).await;
     let run_id = r.body["result"]["run_id"].as_str().unwrap().to_string();
     let plan = home.join("big.md");
     std::fs::write(&plan, format!("### Task 1: Big\n{}", "x".repeat(5_000_001))).unwrap();
@@ -432,7 +432,7 @@ async fn an_idle_daemon_shuts_down_unless_workers_are_active() {
     let opts = DaemonOpts { home: home.clone(), port: 0, sweep_ms: Some(50), idle_shutdown_ms: Some(150) };
     let d = run_daemon(opts).await.unwrap().unwrap();
     let c = Client::of(&home);
-    let r = c.call("run_start", json!({ "repo": home, "test_cmd": "true", "base_branch": "main" })).await;
+    let r = c.call("run_start", json!({ "repo": common::init_repo(), "test_cmd": "true", "base_branch": "main" })).await;
     let run_id = r.body["result"]["run_id"].as_str().unwrap().to_string();
     let b = json!({ "run_id": run_id, "title": "t", "goal": "g", "scope": ["a"], "checks": [], "tier": "light" });
     c.call("brief_add", b).await;

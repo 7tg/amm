@@ -1,7 +1,11 @@
 //! The daemon's HTTP API: `/health`, `/api/{op}` (the MCP tools without their `amm_` prefix) and `/hook/{event}`.
 //! Every request must carry a local Host header (else 403) and the lock file's token (else 401), in that order.
 use crate::hooks::{HookInput, try_handle_hook};
-use crate::service::{Amm, AmmError, AmmResult, BriefInput, BriefPatch, StartRun, resolve_base_branch, resolve_repo};
+use crate::checks::run_check;
+use crate::integration::{create_worktree, integration_branch, remove_worker_worktree};
+use crate::service::{
+    Amm, AmmError, AmmResult, BriefInput, BriefPatch, StartRun, new_run_id, resolve_base_branch, resolve_repo,
+};
 use crate::types::{Brief, BriefState, Report, ReportStatus, Tier};
 use axum::Router;
 use axum::body::Bytes;
@@ -199,6 +203,7 @@ struct RunStartArgs {
     repo: String,
     test_cmd: String,
     base_branch: Option<String>,
+    setup_cmd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -282,17 +287,47 @@ async fn run_op(s: &AppState, op: &str, body: Value) -> AmmResult<Value> {
     Ok(match op {
         "run_start" => {
             let a: RunStartArgs = args(body)?;
-            let (repo, base_branch) = blocking(move || {
+            let budget = lock(amm).limits.gate_budget_ms.max(0) as u64;
+            let id = new_run_id();
+            let (setup_cmd, run_id) = (a.setup_cmd.clone().filter(|c| !c.trim().is_empty()), id.clone());
+            // Resolve, create the integration worktree and run the setup, all outside the lock.
+            let (repo, base_branch, wt) = blocking(move || {
                 let repo = resolve_repo(Path::new(&a.repo));
                 let base = match a.base_branch {
                     Some(b) => b,
                     None => resolve_base_branch(&repo)?,
                 };
-                Ok((repo, base))
+                let wt = create_worktree(&repo, &run_id, &base)?;
+                if let Some(cmd) = &setup_cmd {
+                    let r = run_check(cmd, &wt, budget);
+                    if !r.ok {
+                        let _ = remove_worker_worktree(&repo, &wt, &integration_branch(&run_id));
+                        let how = if r.timed_out { "timed out".to_string() } else { format!("exited {}", r.code.unwrap_or(-1)) };
+                        let tail: String = {
+                            let n = r.output.chars().count();
+                            r.output.chars().skip(n.saturating_sub(1500)).collect()
+                        };
+                        return Err(AmmError(format!("setup_cmd `{cmd}` {how}:\n{tail}")));
+                    }
+                }
+                Ok((repo, base, wt))
             })
             .await?;
-            let input = StartRun { repo: repo.to_string_lossy().into_owned(), test_cmd: a.test_cmd, base_branch };
-            json!({ "run_id": lock(amm).start_run(input)?.id })
+            let input = StartRun {
+                repo: repo.to_string_lossy().into_owned(),
+                test_cmd: a.test_cmd,
+                base_branch,
+                id: Some(id.clone()),
+                integration_worktree: Some(wt.to_string_lossy().into_owned()),
+                setup_cmd: a.setup_cmd,
+            };
+            let started = lock(amm).start_run(input);
+            if let Err(e) = started {
+                let branch = integration_branch(&id);
+                let _ = blocking(move || Ok(remove_worker_worktree(&repo, &wt, &branch))).await;
+                return Err(e);
+            }
+            json!({ "run_id": id })
         }
         "brief_add" => {
             let a: BriefAddArgs = args(body)?;
@@ -387,6 +422,58 @@ mod tests {
     async fn boom(State(s): State<AppState>) -> Response {
         poison(&s.amm);
         not_found()
+    }
+
+    fn app(amm: Amm) -> AppState {
+        AppState { amm: Arc::new(Mutex::new(amm)), token: Arc::from("tok"), port: 0, on_activity: Arc::new(|| {}) }
+    }
+
+    fn rev(dir: &Path, r: &str) -> Option<String> {
+        let o = crate::git::git(dir, &["rev-parse", "--verify", "-q", r]).unwrap();
+        (o.code == 0).then(|| o.stdout.trim().to_string())
+    }
+
+    #[tokio::test]
+    async fn run_start_creates_the_integration_worktree_at_the_base_commit_and_runs_setup_there() {
+        let repo = crate::testutil::init_repo();
+        let s = app(make_amm(DEFAULT_LIMITS).amm);
+        let args = json!({ "repo": repo, "test_cmd": "true", "setup_cmd": "touch ready" });
+        let out = run_op(&s, "run_start", args).await.unwrap();
+        let id = out["run_id"].as_str().unwrap().to_string();
+        let run = lock(&s.amm).run(&id).unwrap();
+        let wt = repo.join(".claude/worktrees").join(format!("amm-{id}"));
+        assert_eq!(run.integration_branch, format!("amm/{id}"));
+        assert_eq!(run.integration_worktree.as_deref(), Some(wt.to_string_lossy().as_ref()));
+        assert_eq!(run.setup_cmd.as_deref(), Some("touch ready"));
+        assert_eq!(rev(&repo, &format!("refs/heads/amm/{id}")), rev(&repo, "main"));
+        assert_eq!(crate::git::worktree_info(&wt).unwrap().branch, Some(format!("amm/{id}")));
+        assert!(wt.join("ready").exists(), "setup_cmd ran outside the integration worktree");
+        assert!(!repo.join("ready").exists());
+        // Cancelling the run leaves the integration worktree for the user.
+        run_op(&s, "cancel", json!({ "id": id })).await.unwrap();
+        assert!(wt.exists());
+    }
+
+    #[tokio::test]
+    async fn a_failing_setup_cmd_removes_the_worktree_and_errors_with_its_output() {
+        let repo = crate::testutil::init_repo();
+        let s = app(make_amm(DEFAULT_LIMITS).amm);
+        let args = json!({ "repo": repo, "test_cmd": "true", "setup_cmd": "echo setup-broke; exit 3" });
+        let e = run_op(&s, "run_start", args).await.unwrap_err().0;
+        assert!(e.contains("setup") && e.contains("setup-broke"), "{e}");
+        let branches = crate::git::git(&repo, &["branch", "--list", "amm/*"]).unwrap().stdout;
+        assert_eq!(branches.trim(), "");
+        let left = std::fs::read_dir(repo.join(".claude/worktrees")).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0);
+        assert!(lock(&s.amm).store.all::<crate::types::Run>().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_start_outside_a_git_repo_fails() {
+        let s = app(make_amm(DEFAULT_LIMITS).amm);
+        let args = json!({ "repo": crate::testutil::tmp_dir(), "test_cmd": "true", "base_branch": "main" });
+        assert!(run_op(&s, "run_start", args).await.is_err());
+        assert!(lock(&s.amm).store.all::<crate::types::Run>().is_empty());
     }
 
     // Not in the TS suite: a panicking handler answers 500, and the mutex it poisoned keeps working.

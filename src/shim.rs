@@ -150,6 +150,7 @@ pub fn tools() -> Vec<Tool> {
                     "repo": sd("Absolute path of the repository (the main session cwd)"),
                     "test_cmd": sd("Full test command for the repo"),
                     "base_branch": s(),
+                    "setup_cmd": sd("command to prepare a fresh checkout, e.g. npm ci"),
                 }),
                 &["repo", "test_cmd"],
             ),

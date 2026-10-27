@@ -691,6 +691,7 @@ mod tests {
                 repo: main.to_string_lossy().into(),
                 test_cmd: "true".into(),
                 base_branch: "main".into(),
+                ..Default::default()
             })
             .unwrap();
         let b = h.amm.add_brief(&run.id, brief_input(&["src/**"], checks), BriefState::Queued).unwrap();

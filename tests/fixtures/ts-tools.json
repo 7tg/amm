@@ -15,6 +15,10 @@
     },
     "base_branch": {
      "type": "string"
+    },
+    "setup_cmd": {
+     "type": "string",
+     "description": "command to prepare a fresh checkout, e.g. npm ci"
     }
    },
    "required": [

@@ -95,10 +95,10 @@ fn shim_starts_the_daemon_and_exposes_amm_tools_over_mcp() {
     for t in TOOLS {
         assert!(names.contains(&t), "{t}");
     }
-    let home = s.home.to_str().unwrap().to_string();
+    let repo = common::init_repo();
     let res = s.call(
         "tools/call",
-        json!({ "name": "amm_run_start", "arguments": { "repo": home, "test_cmd": "true", "base_branch": "main" } }),
+        json!({ "name": "amm_run_start", "arguments": { "repo": repo, "test_cmd": "true", "base_branch": "main" } }),
     );
     let text = res["result"]["content"][0]["text"].as_str().unwrap_or_default();
     let re = regex::Regex::new(r#""run_id":"r[0-9a-f]{6}""#).unwrap();
@@ -106,9 +106,10 @@ fn shim_starts_the_daemon_and_exposes_amm_tools_over_mcp() {
     assert!(read_lock(&s.home).is_some());
 }
 
-/// The TS shim's tools/list output (names, descriptions, input schemas), captured from dist/amm.js.
+/// The tool contract (names, descriptions, input schemas). First captured from the TS shim's dist/amm.js; it is now
+/// the Rust contract, so change it deliberately when a tool changes.
 #[test]
-fn tool_schemas_match_the_typescript_shim() {
+fn tool_schemas_match_the_contract_fixture() {
     let want: Value = serde_json::from_str(include_str!("fixtures/ts-tools.json")).unwrap();
     let mut s = Shim::start();
     let list = s.call("tools/list", json!({}));

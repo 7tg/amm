@@ -57,6 +57,21 @@ pub struct Run {
     pub created_at: i64,
     /// Id of the last event already reported by amm_status.
     pub status_cursor: i64,
+    /// `amm/<run>`; empty for runs started before integration existed.
+    #[serde(default)]
+    pub integration_branch: String,
+    /// Where `integration_branch` is checked out.
+    #[serde(default)]
+    pub integration_worktree: Option<String>,
+    /// Prepares a fresh checkout (e.g. `npm ci`); run in the integration worktree at run start.
+    #[serde(default)]
+    pub setup_cmd: Option<String>,
+    /// Whether the last integration test run passed.
+    #[serde(default)]
+    pub last_test_ok: Option<bool>,
+    /// Briefs merged into `integration_branch`.
+    #[serde(default)]
+    pub merges: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,12 +169,26 @@ mod tests {
             state: RunState::Active,
             created_at: 1,
             status_cursor: 0,
+            integration_branch: "amm/r1".into(),
+            integration_worktree: Some("/r/.claude/worktrees/amm-r1".into()),
+            setup_cmd: None,
+            last_test_ok: None,
+            merges: 0,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["baseBranch"], "main");
         assert_eq!(v["sessionId"], serde_json::Value::Null);
         assert_eq!(v["state"], "active");
+        assert_eq!(v["integrationBranch"], "amm/r1");
         let back: Run = serde_json::from_value(v).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn runs_stored_before_integration_still_load() {
+        let old = serde_json::json!({ "id": "r1", "repo": "/r", "baseBranch": "main", "testCmd": "t", "sessionId": null,
+                                      "state": "active", "createdAt": 1, "statusCursor": 0 });
+        let r: Run = serde_json::from_value(old).unwrap();
+        assert_eq!((r.integration_branch.as_str(), r.integration_worktree, r.merges), ("", None, 0));
     }
 }

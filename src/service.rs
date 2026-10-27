@@ -18,6 +18,11 @@ const NOTABLE: [&str; 6] = ["done", "escalate", "failed", "blocked", "lost", "ca
 /// Worker slots re-acquired outside dispatch never count against capacity (TS: Infinity).
 const UNBOUNDED: usize = usize::MAX;
 
+/// A fresh run id, for callers that must name the run before `start_run` (the integration worktree).
+pub fn new_run_id() -> String {
+    new_id("r")
+}
+
 fn new_id(prefix: &str) -> String {
     format!("{prefix}{:06x}", rand::random::<u32>() & 0xff_ffff)
 }
@@ -55,12 +60,16 @@ fn err<T>(msg: String) -> AmmResult<T> {
     Err(AmmError(msg))
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartRun {
     pub repo: String,
     pub test_cmd: String,
     pub base_branch: String,
+    /// The run id, when the caller chose it before creating the integration worktree; else a fresh one.
+    pub id: Option<String>,
+    pub integration_worktree: Option<String>,
+    pub setup_cmd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,8 +229,13 @@ impl Amm {
     pub fn start_run(&mut self, input: StartRun) -> AmmResult<Run> {
         let repo = input.repo;
         let base_branch = input.base_branch;
+        let id = input.id.unwrap_or_else(new_run_id);
+        if self.store.get::<Run>(&id).is_some() {
+            return err(format!("run {id} already exists"));
+        }
         let run = Run {
-            id: new_id("r"),
+            integration_branch: crate::integration::integration_branch(&id),
+            id,
             repo,
             base_branch: base_branch.clone(),
             test_cmd: input.test_cmd,
@@ -229,9 +243,18 @@ impl Amm {
             state: RunState::Active,
             created_at: self.t(),
             status_cursor: 0,
+            integration_worktree: input.integration_worktree,
+            setup_cmd: input.setup_cmd,
+            last_test_ok: None,
+            merges: 0,
         };
         self.store.put(&run)?;
-        self.event("run_start", Some(&run.id), None, serde_json::json!({ "repo": run.repo, "baseBranch": base_branch }))?;
+        self.event(
+            "run_start",
+            Some(&run.id),
+            None,
+            serde_json::json!({ "repo": run.repo, "baseBranch": base_branch, "integrationBranch": run.integration_branch }),
+        )?;
         Ok(run)
     }
 
@@ -931,7 +954,7 @@ mod service_tests {
         let mut h = make_amm(limits);
         let run = h
             .amm
-            .start_run(StartRun { repo: "/repo".into(), test_cmd: "npm test".into(), base_branch: "main".into() })
+            .start_run(StartRun { repo: "/repo".into(), test_cmd: "npm test".into(), base_branch: "main".into(), ..Default::default() })
             .unwrap();
         (h, run)
     }
@@ -1083,6 +1106,7 @@ mod lifecycle_tests {
                 repo: repo.to_string_lossy().into_owned(),
                 test_cmd: "npm test".into(),
                 base_branch: "main".into(),
+                ..Default::default()
             })
             .unwrap();
         let b = h.amm.add_brief(&run.id, light("t", "src/**", checks), BriefState::Queued).unwrap();
@@ -1313,7 +1337,7 @@ mod review_tests {
         let mut h = make_amm(DEFAULT_LIMITS);
         let run = h
             .amm
-            .start_run(StartRun { repo: "/repo".into(), test_cmd: "t".into(), base_branch: "main".into() })
+            .start_run(StartRun { repo: "/repo".into(), test_cmd: "t".into(), base_branch: "main".into(), ..Default::default() })
             .unwrap();
         (h, run)
     }
@@ -1472,6 +1496,7 @@ mod review_tests {
                 repo: repo.to_string_lossy().into_owned(),
                 test_cmd: "t".into(),
                 base_branch: "main".into(),
+                ..Default::default()
             })
             .unwrap();
         assert_eq!(run.repo, h.dir.canonicalize().unwrap().to_string_lossy());

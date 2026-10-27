@@ -4,6 +4,7 @@ pub mod daemon;
 pub mod git;
 pub mod hook_client;
 pub mod hooks;
+pub mod integration;
 pub mod http;
 pub mod plan_import;
 pub mod rules;
