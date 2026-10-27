@@ -66,8 +66,8 @@ pub fn amm_home(env: &Env) -> PathBuf {
     if let Some(h) = env.get("AMM_HOME") {
         return PathBuf::from(h);
     }
-    let home = env.get("HOME").cloned().or_else(|| std::env::var("HOME").ok()).unwrap_or_default();
-    PathBuf::from(home).join(".amm")
+    let home = std::env::home_dir().unwrap_or_default();
+    home.join(".amm")
 }
 
 pub fn next_tier(tier: Tier) -> Option<Tier> {
