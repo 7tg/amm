@@ -447,6 +447,19 @@ async fn an_idle_daemon_shuts_down_unless_workers_are_active() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_request_that_outlasts_the_idle_window_keeps_the_daemon_alive() {
+    let home = common::tmp_dir();
+    let opts = DaemonOpts { home: home.clone(), port: 0, sweep_ms: Some(50), idle_shutdown_ms: Some(150) };
+    let d = run_daemon(opts).await.unwrap().unwrap();
+    let c = Client::of(&home);
+    let args = json!({ "repo": common::init_repo(), "test_cmd": "true", "base_branch": "main", "setup_cmd": "sleep 1" });
+    let r = c.call("run_start", args).await;
+    assert!(r.body["result"]["run_id"].is_string(), "{}", r.body);
+    assert!(read_lock(&home).is_some(), "shut down during a request");
+    d.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn close_drops_connections_that_are_still_open() {
     let home = common::tmp_dir();
     let d = start(&home).await;

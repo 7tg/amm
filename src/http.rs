@@ -20,6 +20,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tower_http::catch_panic::CatchPanicLayer;
 
@@ -36,8 +37,51 @@ pub struct AppState {
     pub token: Arc<str>,
     /// The port the daemon listens on; Host must name it.
     pub port: u16,
-    /// Called for every authenticated request (keeps the daemon from idling out).
-    pub on_activity: Arc<dyn Fn() + Send + Sync>,
+    /// Authenticated requests, which keep the daemon from idling out.
+    pub activity: Arc<Activity>,
+}
+
+/// When the last authenticated request ended, and how many are still running.
+pub struct Activity {
+    last_ms: AtomicI64,
+    in_flight: AtomicUsize,
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Activity { last_ms: AtomicI64::new(now_ms()), in_flight: AtomicUsize::new(0) }
+    }
+}
+
+impl Activity {
+    /// How long the daemon has had no authenticated request running, or None while one is.
+    pub fn idle_ms(&self) -> Option<i64> {
+        (self.in_flight.load(Ordering::SeqCst) == 0).then(|| now_ms() - self.last_ms.load(Ordering::SeqCst))
+    }
+
+    fn touch(&self) {
+        self.last_ms.store(now_ms(), Ordering::SeqCst);
+    }
+
+    /// Counts a request as running until the guard drops, also when the request is cancelled.
+    fn enter(self: &Arc<Self>) -> InFlight {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        self.touch();
+        InFlight(self.clone())
+    }
+}
+
+struct InFlight(Arc<Activity>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.touch();
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 fn lock(amm: &Mutex<Amm>) -> MutexGuard<'_, Amm> {
@@ -114,7 +158,7 @@ async fn guard(State(s): State<AppState>, req: Request, next: Next) -> Response 
         if !same(given.as_bytes(), s.token.as_bytes()) {
             return error(StatusCode::UNAUTHORIZED, "bad token");
         }
-        (s.on_activity)();
+        s.activity.touch();
         let cookie = format!("amm_token={}; HttpOnly; SameSite=Strict; Path=/", s.token);
         let mut r = StatusCode::SEE_OTHER.into_response();
         r.headers_mut().insert(header::LOCATION, HeaderValue::from_static("/"));
@@ -127,7 +171,7 @@ async fn guard(State(s): State<AppState>, req: Request, next: Next) -> Response 
     if !cookie && !token_ok(&req, s.token.as_bytes()) {
         return error(StatusCode::UNAUTHORIZED, "bad token");
     }
-    (s.on_activity)();
+    let _busy = s.activity.enter();
     next.run(req).await
 }
 
@@ -519,7 +563,7 @@ mod tests {
     }
 
     fn app(amm: Amm) -> AppState {
-        AppState { amm: Arc::new(Mutex::new(amm)), token: Arc::from("tok"), port: 0, on_activity: Arc::new(|| {}) }
+        AppState { amm: Arc::new(Mutex::new(amm)), token: Arc::from("tok"), port: 0, activity: Arc::default() }
     }
 
     fn rev(dir: &Path, r: &str) -> Option<String> {
@@ -638,7 +682,7 @@ mod tests {
             amm: Arc::new(Mutex::new(h.amm)),
             token: Arc::from("tok"),
             port,
-            on_activity: Arc::new(|| {}),
+            activity: Arc::default(),
         };
         let routes = Router::new().route("/boom", any(boom)).route("/api/{op}", any(api));
         let app = finish(routes, state.clone());

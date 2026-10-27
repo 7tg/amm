@@ -1,6 +1,6 @@
 //! The amm daemon: one per home directory, found through `daemon.lock` ({pid, port, token}).
 use crate::config::{DEFAULT_PORT, Env, amm_home, load_limits};
-use crate::http::{AppState, router};
+use crate::http::{Activity, AppState, router};
 use crate::service::Amm;
 use crate::store::Store;
 use crate::types::Clock;
@@ -11,7 +11,6 @@ use std::fs::{DirBuilder, OpenOptions, Permissions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -180,13 +179,12 @@ pub async fn run_daemon(opts: DaemonOpts) -> DaemonResult<Option<DaemonHandle>> 
     let pid = std::process::id();
     write_lock(&home, &Lock { pid, port, token: token.clone() })?;
 
-    let last_activity = Arc::new(AtomicI64::new(now_ms()));
-    let activity = last_activity.clone();
+    let activity = Arc::new(Activity::default());
     let state = AppState {
         amm: amm.clone(),
         token: Arc::from(token),
         port,
-        on_activity: Arc::new(move || activity.store(now_ms(), Ordering::Relaxed)),
+        activity: activity.clone(),
     };
     let app = router(state);
 
@@ -201,7 +199,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> DaemonResult<Option<DaemonHandle>> 
             let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             loop {
                 tick.tick().await;
-                let (amm, last_activity) = (amm.clone(), last_activity.clone());
+                let (amm, activity) = (amm.clone(), activity.clone());
                 // Sweeping writes to sqlite: keep it off the async workers. A panic surfaces as a JoinError.
                 let shared = amm.clone();
                 let idle = tokio::task::spawn_blocking(move || {
@@ -212,7 +210,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> DaemonResult<Option<DaemonHandle>> 
                             false
                         }
                         Ok(()) => {
-                            now_ms() - last_activity.load(Ordering::Relaxed) > idle_ms
+                            activity.idle_ms().is_some_and(|ms| ms > idle_ms)
                                 && a.active_workers(None).is_empty()
                                 && a.merging.is_empty()
                         }
