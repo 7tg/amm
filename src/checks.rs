@@ -1,9 +1,7 @@
-use std::io::Read;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,9 +14,8 @@ pub struct CheckResult {
 }
 
 const OUTPUT_TAIL: usize = 4000;
-/// A char is at most 4 bytes, so this many raw bytes always cover the last OUTPUT_TAIL chars.
-const KEEP_BYTES: usize = OUTPUT_TAIL * 4;
 const GRACE: Duration = Duration::from_millis(200);
+const POLL_SLICE_MS: i32 = 20;
 
 fn kill_group(pid: u32) {
     // SAFETY: plain syscall; a negative pid addresses the process group. ESRCH (already gone) is ignored.
@@ -27,33 +24,115 @@ fn kill_group(pid: u32) {
     }
 }
 
-fn tail(bytes: &[u8]) -> String {
-    let s = String::from_utf8_lossy(bytes);
-    let n = s.chars().count();
-    s.chars().skip(n.saturating_sub(OUTPUT_TAIL)).collect()
+/// One output pipe: its fd (None once closed) and bytes of an incomplete trailing UTF-8 sequence.
+struct Stream {
+    fd: Option<OwnedFd>,
+    pending: Vec<u8>,
 }
 
-fn spawn_reader<R: Read + Send + 'static>(mut r: R, buf: Arc<Mutex<Vec<u8>>>, done: mpsc::Sender<()>) {
-    std::thread::spawn(move || {
+impl Stream {
+    fn new(fd: OwnedFd) -> Stream {
+        // SAFETY: fcntl on a valid owned fd.
+        unsafe {
+            let fl = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        Stream { fd: Some(fd), pending: Vec::new() }
+    }
+
+    /// Reads whatever is available into `tail`; closes the fd on EOF or a hard error.
+    fn drain(&mut self, tail: &mut String) {
+        let Some(fd) = &self.fd else { return };
         let mut chunk = [0u8; 8192];
-        while let Ok(n) = r.read(&mut chunk) {
-            if n == 0 {
+        loop {
+            // SAFETY: reading into a local buffer of the stated length.
+            let n = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+            if n > 0 {
+                self.pending.extend_from_slice(&chunk[..n as usize]);
+                decode(&mut self.pending, tail, false);
+            } else if n == 0 {
                 break;
-            }
-            let mut b = buf.lock().unwrap();
-            b.extend_from_slice(&chunk[..n]);
-            if b.len() > KEEP_BYTES {
-                let cut = b.len() - KEEP_BYTES;
-                b.drain(..cut);
+            } else {
+                match std::io::Error::last_os_error().kind() {
+                    std::io::ErrorKind::WouldBlock => return,
+                    std::io::ErrorKind::Interrupted => continue,
+                    _ => break,
+                }
             }
         }
-        let _ = done.send(());
-    });
+        decode(&mut self.pending, tail, true);
+        self.fd = None;
+    }
+}
+
+/// Moves valid UTF-8 from `pending` to `tail`, keeping an incomplete trailing sequence unless `flush`.
+/// Invalid bytes become U+FFFD. `tail` is then capped to its last OUTPUT_TAIL chars.
+fn decode(pending: &mut Vec<u8>, tail: &mut String, flush: bool) {
+    let mut start = 0;
+    loop {
+        match std::str::from_utf8(&pending[start..]) {
+            Ok(s) => {
+                tail.push_str(s);
+                start = pending.len();
+                break;
+            }
+            Err(e) => {
+                let ok_end = start + e.valid_up_to();
+                tail.push_str(std::str::from_utf8(&pending[start..ok_end]).unwrap_or(""));
+                match e.error_len() {
+                    Some(n) => {
+                        tail.push('\u{fffd}');
+                        start = ok_end + n;
+                    }
+                    None => {
+                        start = ok_end;
+                        if flush {
+                            tail.push('\u{fffd}');
+                            start = pending.len();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    pending.drain(..start);
+    let n = tail.chars().count();
+    if n > OUTPUT_TAIL {
+        let cut = tail.char_indices().nth(n - OUTPUT_TAIL).map_or(0, |(i, _)| i);
+        tail.drain(..cut);
+    }
+}
+
+/// Waits up to `slice_ms` for output on the open pipes and drains them.
+fn pump(streams: &mut [Stream; 2], tail: &mut String, slice_ms: i32) {
+    let mut fds: Vec<libc::pollfd> = Vec::new();
+    let mut idx = Vec::new();
+    for (i, st) in streams.iter().enumerate() {
+        if let Some(fd) = &st.fd {
+            fds.push(libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            idx.push(i);
+        }
+    }
+    if fds.is_empty() {
+        std::thread::sleep(Duration::from_millis(slice_ms.max(0) as u64));
+        return;
+    }
+    // SAFETY: fds is a valid array of pollfd of the given length. EINTR just yields no events.
+    let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, slice_ms) };
+    if n > 0 {
+        for (k, pfd) in fds.iter().enumerate() {
+            if pfd.revents != 0 {
+                streams[idx[k]].drain(tail);
+            }
+        }
+    }
 }
 
 /// Runs `cmd` with `sh -c` in its own process group. Blocking; async callers use `spawn_blocking`.
-/// On exit the whole group is killed (a check must not leave daemons behind) and the pipes get a 200 ms grace
-/// before we stop waiting for them (a `setsid` grandchild may hold them open).
+/// The calling thread polls both pipes. On exit the whole group is killed (a check must not leave daemons
+/// behind) and the pipes get a 200 ms grace before both fds are dropped, so a `setsid` grandchild that still
+/// holds the write end gets EPIPE and nothing leaks.
 pub fn run_check(cmd: &str, cwd: &Path, timeout_ms: u64) -> CheckResult {
     let fail = |output: String| CheckResult { cmd: cmd.to_string(), ok: false, code: None, timed_out: false, output };
     let mut child = match Command::new("sh")
@@ -69,10 +148,11 @@ pub fn run_check(cmd: &str, cwd: &Path, timeout_ms: u64) -> CheckResult {
         Err(e) => return fail(e.to_string()),
     };
     let pid = child.id();
-    let buf = Arc::new(Mutex::new(Vec::new()));
-    let (tx, rx) = mpsc::channel();
-    spawn_reader(child.stdout.take().unwrap(), buf.clone(), tx.clone());
-    spawn_reader(child.stderr.take().unwrap(), buf.clone(), tx);
+    let mut streams = [
+        Stream::new(OwnedFd::from(child.stdout.take().expect("piped stdout"))),
+        Stream::new(OwnedFd::from(child.stderr.take().expect("piped stderr"))),
+    ];
+    let mut tail = String::new();
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut timed_out = false;
@@ -82,7 +162,8 @@ pub fn run_check(cmd: &str, cwd: &Path, timeout_ms: u64) -> CheckResult {
             Ok(None) => {}
             Err(e) => break Err(e),
         }
-        if !timed_out && Instant::now() >= deadline {
+        let now = Instant::now();
+        if !timed_out && now >= deadline {
             // The flag is set only if the child had not exited by the time the timer fired.
             match child.try_wait() {
                 Ok(Some(st)) => break Ok(st),
@@ -93,22 +174,31 @@ pub fn run_check(cmd: &str, cwd: &Path, timeout_ms: u64) -> CheckResult {
                 Err(e) => break Err(e),
             }
         }
-        std::thread::sleep(Duration::from_millis(2));
+        let slice = if timed_out {
+            POLL_SLICE_MS
+        } else {
+            (deadline.saturating_duration_since(now).as_millis().min(POLL_SLICE_MS as u128) as i32).max(1)
+        };
+        pump(&mut streams, &mut tail, slice);
     };
     kill_group(pid);
-    // Wait for both pipes to close, but no longer than the grace period.
     let grace_end = Instant::now() + GRACE;
-    for _ in 0..2 {
+    while streams.iter().any(|s| s.fd.is_some()) {
         let left = grace_end.saturating_duration_since(Instant::now());
-        if rx.recv_timeout(left).is_err() {
+        if left.is_zero() {
             break;
         }
+        pump(&mut streams, &mut tail, left.as_millis().min(POLL_SLICE_MS as u128).max(1) as i32);
     }
-    let output = tail(&buf.lock().unwrap());
+    for st in &mut streams {
+        if st.fd.take().is_some() {
+            decode(&mut st.pending, &mut tail, true);
+        }
+    }
     match status {
         Ok(st) => {
             let code = st.code();
-            CheckResult { cmd: cmd.to_string(), ok: code == Some(0) && !timed_out, code, timed_out, output }
+            CheckResult { cmd: cmd.to_string(), ok: code == Some(0) && !timed_out, code, timed_out, output: tail }
         }
         Err(e) => fail(e.to_string()),
     }
@@ -237,5 +327,19 @@ mod tests {
         assert!(r.ok && !r.timed_out);
         std::thread::sleep(Duration::from_millis(900));
         assert!(!marker.exists(), "background child survived the check");
+    }
+
+    #[test]
+    fn run_check_decodes_a_utf8_char_split_across_reads_and_streams() {
+        let r = run_check("printf '\\303'; printf x >&2; sleep .1; printf '\\251'", tmp(), 5_000);
+        assert!(r.output.contains('\u{e9}'), "{:?}", r.output);
+        assert!(r.output.contains('x'));
+        assert!(!r.output.contains('\u{fffd}'), "{:?}", r.output);
+    }
+
+    #[test]
+    fn run_check_replaces_genuinely_invalid_bytes() {
+        let r = run_check("printf 'a\\377b'", tmp(), 5_000);
+        assert_eq!(r.output, "a\u{fffd}b");
     }
 }
