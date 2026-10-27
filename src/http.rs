@@ -2,6 +2,7 @@
 //! Every request must carry a local Host header (else 403) and the lock file's token (else 401), in that order.
 use crate::hooks::{HookInput, try_handle_hook};
 use crate::checks::run_check;
+use crate::git::worktree_info;
 use crate::integration::{create_worktree, integration_branch, remove_worker_worktree};
 use crate::service::{
     Amm, AmmError, AmmResult, BriefInput, BriefPatch, StartRun, new_run_id, resolve_base_branch, resolve_repo,
@@ -291,7 +292,7 @@ async fn run_op(s: &AppState, op: &str, body: Value) -> AmmResult<Value> {
             let id = new_run_id();
             let (setup_cmd, run_id) = (a.setup_cmd.clone().filter(|c| !c.trim().is_empty()), id.clone());
             // Resolve, create the integration worktree and run the setup, all outside the lock.
-            let (repo, base_branch, wt) = blocking(move || {
+            let (repo, base_branch, wt, head) = blocking(move || {
                 let repo = resolve_repo(Path::new(&a.repo));
                 let base = match a.base_branch {
                     Some(b) => b,
@@ -310,7 +311,8 @@ async fn run_op(s: &AppState, op: &str, body: Value) -> AmmResult<Value> {
                         return Err(AmmError(format!("setup_cmd `{cmd}` {how}:\n{tail}")));
                     }
                 }
-                Ok((repo, base, wt))
+                let head = worktree_info(&wt)?.head;
+                Ok((repo, base, wt, head))
             })
             .await?;
             let input = StartRun {
@@ -319,6 +321,7 @@ async fn run_op(s: &AppState, op: &str, body: Value) -> AmmResult<Value> {
                 base_branch,
                 id: Some(id.clone()),
                 integration_worktree: Some(wt.to_string_lossy().into_owned()),
+                integration_head: Some(head),
                 setup_cmd: a.setup_cmd,
             };
             let started = lock(amm).start_run(input);
@@ -445,6 +448,7 @@ mod tests {
         assert_eq!(run.integration_branch, format!("amm/{id}"));
         assert_eq!(run.integration_worktree.as_deref(), Some(wt.to_string_lossy().as_ref()));
         assert_eq!(run.setup_cmd.as_deref(), Some("touch ready"));
+        assert_eq!(run.integration_head, rev(&repo, "main"));
         assert_eq!(rev(&repo, &format!("refs/heads/amm/{id}")), rev(&repo, "main"));
         assert_eq!(crate::git::worktree_info(&wt).unwrap().branch, Some(format!("amm/{id}")));
         assert!(wt.join("ready").exists(), "setup_cmd ran outside the integration worktree");

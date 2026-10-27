@@ -72,6 +72,10 @@ pub struct Run {
     /// Briefs merged into `integration_branch`.
     #[serde(default)]
     pub merges: u32,
+    /// The commit amm last left `integration_branch` on (its creation, then each merge). The gate trusts this, never
+    /// the branch ref, which a worker could move.
+    #[serde(default)]
+    pub integration_head: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +109,9 @@ pub struct Brief {
     pub attempt: i64,
     pub notes: Vec<String>,
     pub report: Option<Report>,
+    /// Times this brief's merge failed the integration tests.
+    #[serde(default)]
+    pub integration_failures: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -174,6 +181,7 @@ mod tests {
             setup_cmd: None,
             last_test_ok: None,
             merges: 0,
+            integration_head: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["baseBranch"], "main");

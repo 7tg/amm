@@ -18,6 +18,9 @@ const NOTABLE: [&str; 6] = ["done", "escalate", "failed", "blocked", "lost", "ca
 /// Worker slots re-acquired outside dispatch never count against capacity (TS: Infinity).
 const UNBOUNDED: usize = usize::MAX;
 
+/// Start of the note the merge queue leaves when a brief's merge conflicts.
+pub const CONFLICT_NOTE: &str = "merge conflict with the integration branch";
+
 /// A fresh run id, for callers that must name the run before `start_run` (the integration worktree).
 pub fn new_run_id() -> String {
     new_id("r")
@@ -69,6 +72,8 @@ pub struct StartRun {
     /// The run id, when the caller chose it before creating the integration worktree; else a fresh one.
     pub id: Option<String>,
     pub integration_worktree: Option<String>,
+    /// The commit the integration branch was created on.
+    pub integration_head: Option<String>,
     pub setup_cmd: Option<String>,
 }
 
@@ -122,8 +127,11 @@ pub struct WorktreeCheck {
     pub base_sha: String,
 }
 
-/// Bind phase 2, run without `Amm`: checks that `cwd` is an agent worktree of `run_repo` and finds its base commit.
-pub fn validate_worktree(run_repo: &Path, cwd: &Path) -> Result<WorktreeCheck, String> {
+/// Bind phase 2, run without `Amm`: checks that `cwd` is an agent worktree of `run_repo` and finds its base commit:
+/// `merge-base(HEAD, refs/heads/<integration_branch>)`, or `merge-base(HEAD, <run_repo HEAD>)` when that is newer or
+/// the integration branch is missing (runs from before integration). Both are ancestors of the worker's HEAD, which
+/// the worker cannot have touched yet, so neither can excuse a change it makes later.
+pub fn validate_worktree(run_repo: &Path, cwd: &Path, integration_branch: &str) -> Result<WorktreeCheck, String> {
     let first_line = |e: String| e.lines().next().unwrap_or("").to_string();
     let repo = worktree_info(run_repo).map_err(first_line)?;
     let info = worktree_info(cwd).map_err(first_line)?;
@@ -139,12 +147,33 @@ pub fn validate_worktree(run_repo: &Path, cwd: &Path) -> Result<WorktreeCheck, S
             return Err(format!("branch {} is not a worktree-agent-* branch", other.as_deref().unwrap_or("(detached)")));
         }
     };
-    let mb = git(&info.toplevel, &["merge-base", "HEAD", &repo.head]).map_err(first_line)?;
-    let sha = mb.stdout.trim();
-    if mb.code != 0 || sha.is_empty() {
-        return Err("could not determine the base commit".into());
-    }
-    Ok(WorktreeCheck { toplevel: info.toplevel.to_string_lossy().into_owned(), branch, base_sha: sha.to_string() })
+    let merge_base = |other: &str| -> Result<Option<String>, String> {
+        let mb = git(&info.toplevel, &["merge-base", "--end-of-options", "HEAD", other]).map_err(first_line)?;
+        let sha = mb.stdout.trim();
+        Ok((mb.code == 0 && !sha.is_empty()).then(|| sha.to_string()))
+    };
+    let main = merge_base(&repo.head)?;
+    let integration = if integration_branch.is_empty() {
+        None
+    } else {
+        let r = git(&info.toplevel, &["rev-parse", "--verify", "-q", "--end-of-options", &format!("refs/heads/{integration_branch}^{{commit}}")])
+            .map_err(first_line)?;
+        match r.stdout.trim() {
+            tip if r.code == 0 && !tip.is_empty() => merge_base(tip)?,
+            _ => None,
+        }
+    };
+    let sha = match (integration, main) {
+        (Some(i), Some(m)) => {
+            // The integration fork point, unless the main checkout moved past it since the run started.
+            let newer = git(&info.toplevel, &["merge-base", "--is-ancestor", "--end-of-options", &i, &m]).map_err(first_line)?;
+            if newer.code == 0 && i != m { m } else { i }
+        }
+        (Some(i), None) => i,
+        (None, Some(m)) => m,
+        (None, None) => return Err("could not determine the base commit".into()),
+    };
+    Ok(WorktreeCheck { toplevel: info.toplevel.to_string_lossy().into_owned(), branch, base_sha: sha })
 }
 
 /// The real path of `path` when it exists, else `path` as given. Touches the filesystem; call it without the lock.
@@ -247,6 +276,7 @@ impl Amm {
             setup_cmd: input.setup_cmd,
             last_test_ok: None,
             merges: 0,
+            integration_head: input.integration_head,
         };
         self.store.put(&run)?;
         self.event(
@@ -283,6 +313,7 @@ impl Amm {
             attempt: 1,
             notes: vec![],
             report: None,
+            integration_failures: 0,
         };
         self.store.put(&b)?;
         self.event(
@@ -469,14 +500,18 @@ impl Amm {
     pub fn brief_text(&self, brief_id: &str) -> AmmResult<String> {
         let b = self.brief(brief_id)?;
         let report = tool_name("amm_report", &self.env);
-        let mut out: Vec<String> = vec![
-            format!("# amm brief {}: {}", b.id, b.title),
-            String::new(),
+        let branch = self.run(&b.run_id).map(|r| r.integration_branch).unwrap_or_default();
+        let mut out: Vec<String> = vec![format!("# amm brief {}: {}", b.id, b.title), String::new()];
+        if !branch.is_empty() {
+            out.push(format!("Integration branch: {branch}."));
+            out.push(String::new());
+        }
+        out.extend([
             "## Goal".into(),
             b.goal.clone(),
             String::new(),
             "## Scope (you may only create or edit these paths, relative to your worktree root)".into(),
-        ];
+        ]);
         out.extend(b.scope.iter().map(|s| format!("- {s}")));
         out.push(String::new());
         out.push("## Done checks (all must pass, run from the worktree root)".into());
@@ -486,8 +521,15 @@ impl Amm {
             out.extend(b.checks.iter().map(|c| format!("- `{c}`")));
         }
         out.push(String::new());
-        if !b.notes.is_empty() {
+        let merge_first = !branch.is_empty()
+            && (b.integration_failures > 0 || b.notes.iter().any(|n| n.starts_with(CONFLICT_NOTE)));
+        if !b.notes.is_empty() || merge_first {
             out.push("## Notes from earlier attempts".into());
+            if merge_first {
+                out.push(format!(
+                    "- First run: git merge --no-edit {branch} (resolve any conflicts inside your scope), then fix the failure below."
+                ));
+            }
             out.extend(b.notes.iter().map(|n| format!("- {n}")));
             out.push(String::new());
         }
@@ -674,7 +716,10 @@ impl Amm {
         match self.claim_bind(brief_id, agent_id, cwd)? {
             BindClaim::Bound(w) => Ok(w),
             BindClaim::Claimed(w) => {
-                let check = self.run(&w.run_id).map_err(|e| e.0).and_then(|r| validate_worktree(Path::new(&r.repo), cwd));
+                let check = self
+                    .run(&w.run_id)
+                    .map_err(|e| e.0)
+                    .and_then(|r| validate_worktree(Path::new(&r.repo), cwd, &r.integration_branch));
                 self.finish_bind(&w.id, agent_id, check)
             }
         }
@@ -1046,6 +1091,25 @@ mod service_tests {
     }
 
     #[test]
+    fn brief_text_names_the_integration_branch_and_tells_retries_to_merge_it_first() {
+        let (mut h, run) = setup(DEFAULT_LIMITS);
+        let amm = &mut h.amm;
+        let b = amm.add_brief(&run.id, brief("parser", &["src/parser.ts"], Tier::Standard), BriefState::Queued).unwrap();
+        let merge_first = format!("First run: git merge --no-edit amm/{} (resolve any conflicts inside your scope), then fix the failure below.", run.id);
+        let text = amm.brief_text(&b.id).unwrap();
+        assert!(text.contains(&format!("Integration branch: amm/{}.", run.id)), "{text}");
+        assert!(!text.contains("First run: git merge"), "{text}");
+        let b = amm.brief(&b.id).unwrap();
+        amm.store.put(&Brief { integration_failures: 1, notes: vec!["tests failed".into()], ..b.clone() }).unwrap();
+        let text = amm.brief_text(&b.id).unwrap();
+        let notes = text.split("## Notes from earlier attempts\n").nth(1).unwrap();
+        assert!(notes.starts_with(&format!("- {merge_first}\n- tests failed")), "{text}");
+        let conflict = format!("{CONFLICT_NOTE}: src/x.ts");
+        amm.store.put(&Brief { integration_failures: 0, notes: vec![conflict], ..b.clone() }).unwrap();
+        assert!(amm.brief_text(&b.id).unwrap().contains(&merge_first));
+    }
+
+    #[test]
     fn brief_text_gives_the_worker_goal_scope_checks_and_report_instructions() {
         let (mut h, run) = setup(DEFAULT_LIMITS);
         let amm = &mut h.amm;
@@ -1161,6 +1225,24 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn bind_bases_on_the_integration_branch_and_falls_back_to_the_repo_head_without_one() {
+        let (h, run, _b, repo) = started(DEFAULT_LIMITS);
+        let main_head = crate::git::worktree_info(&repo).unwrap().head;
+        let iwt = crate::integration::create_worktree(&repo, &run.id, "main").unwrap();
+        std::fs::write(iwt.join("merged.txt"), "m\n").unwrap();
+        git(&iwt, &["add", "."]);
+        git(&iwt, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "merged"]);
+        let tip = crate::git::worktree_info(&iwt).unwrap().head;
+        // A worker worktree whose HEAD already holds the integration branch.
+        let wt = wt(&repo);
+        git(&wt, &["merge", "-q", "--ff-only", &run.integration_branch]);
+        let repo_path = Path::new(&h.amm.run(&run.id).unwrap().repo).to_path_buf();
+        assert_eq!(validate_worktree(&repo_path, &wt, &run.integration_branch).unwrap().base_sha, tip);
+        assert_eq!(validate_worktree(&repo_path, &wt, "").unwrap().base_sha, main_head);
+        assert_eq!(validate_worktree(&repo_path, &wt, "amm/missing").unwrap().base_sha, main_head);
+    }
+
+    #[test]
     fn commits_made_before_bind_stay_in_the_base_head_diff() {
         let (mut h, _run, b, repo) = started(DEFAULT_LIMITS);
         let wt = wt(&repo);
@@ -1248,7 +1330,7 @@ mod lifecycle_tests {
             panic!("expected a fresh claim");
         };
         amm.cancel(&b.id).unwrap();
-        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &wt);
+        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &wt, "");
         assert!(check.is_ok());
         assert_eq!(amm.finish_bind(&w.id, "agent-1", check).unwrap_err(), "brief was cancelled");
         let after = amm.store.get::<Worker>(&w.id).unwrap();
@@ -1266,7 +1348,7 @@ mod lifecycle_tests {
         let wt = wt(&repo);
         let BindClaim::Claimed(w) = amm.claim_bind(&b.id, "agent-1", &wt).unwrap() else { panic!("claim") };
         amm.store.put(&Worker { agent_id: Some("agent-2".into()), ..w.clone() }).unwrap();
-        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &wt);
+        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &wt, "");
         let e = amm.finish_bind(&w.id, "agent-1", check).unwrap_err();
         assert!(e.contains("another agent"), "{e}");
         let after = amm.store.get::<Worker>(&w.id).unwrap();
@@ -1281,7 +1363,7 @@ mod lifecycle_tests {
         let BindClaim::Claimed(w) = h.amm.claim_bind(&b.id, "agent-1", &wt).unwrap() else { panic!("claim") };
         h.clock.advance(1001);
         h.amm.sweep().unwrap();
-        let check = validate_worktree(Path::new(&h.amm.run(&run.id).unwrap().repo), &wt);
+        let check = validate_worktree(Path::new(&h.amm.run(&run.id).unwrap().repo), &wt, "");
         assert_eq!(h.amm.finish_bind(&w.id, "agent-1", check).unwrap_err(), "worker lost");
         assert_eq!(h.amm.store.get::<Worker>(&w.id).unwrap().base_sha, None);
     }
@@ -1314,7 +1396,7 @@ mod lifecycle_tests {
             panic!("expected a fresh claim");
         };
         amm.cancel(&b.id).unwrap();
-        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &repo);
+        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &repo, "");
         assert!(amm.finish_bind(&w.id, "agent-1", check).is_err());
         assert_eq!(amm.store.all::<Worker>()[0].state, WorkerState::Cancelled);
     }
@@ -1421,7 +1503,7 @@ mod review_tests {
             results.push(match c {
                 Ok(BindClaim::Claimed(w)) => {
                     let agent = w.agent_id.clone().unwrap();
-                    amm.finish_bind(&w.id, &agent, validate_worktree(Path::new(&run_repo), cwd))
+                    amm.finish_bind(&w.id, &agent, validate_worktree(Path::new(&run_repo), cwd, ""))
                 }
                 Ok(BindClaim::Bound(w)) => Ok(w),
                 Err(e) => Err(e),

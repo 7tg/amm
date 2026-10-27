@@ -83,13 +83,13 @@ fn log_err(what: &str, e: impl std::fmt::Display) {
     eprintln!("amm: {what}: {e}");
 }
 
-type ValidateFn = dyn Fn(&Path, &Path) -> Result<WorktreeCheck, String> + Send + Sync;
+type ValidateFn = dyn Fn(&Path, &Path, &str) -> Result<WorktreeCheck, String> + Send + Sync;
 type DiffFn = dyn Fn(&Path, &str, &str) -> Result<Vec<String>, String> + Send + Sync;
 
 /// The blocking work the handlers delegate, swappable in tests to land a cancel or a branch move mid-flight.
 #[derive(Clone)]
 pub(crate) struct Seams {
-    /// Bind phase 2: `validate_worktree(run_repo, cwd)`.
+    /// Bind phase 2: `validate_worktree(run_repo, cwd, integration_branch)`.
     pub validate: Arc<ValidateFn>,
     /// The gate's diff: `changed_files(root, base_sha, sha)`.
     pub diff: Arc<DiffFn>,
@@ -166,15 +166,15 @@ async fn bind(state: &Arc<Mutex<Amm>>, brief_id: &str, agent_id: &str, cwd: &str
         match amm.claim_bind(brief_id, agent_id, Path::new(cwd))? {
             BindClaim::Bound(w) => return Ok(w),
             BindClaim::Claimed(w) => {
-                let repo = amm.run(&w.run_id).map(|r| r.repo).map_err(|e| e.0);
+                let repo = amm.run(&w.run_id).map(|r| (r.repo, r.integration_branch)).map_err(|e| e.0);
                 (w, repo)
             }
         }
     };
     let check = match repo {
-        Ok(repo) => {
+        Ok((repo, branch)) => {
             let (cwd, validate) = (cwd.to_string(), seams.validate.clone());
-            tokio::task::spawn_blocking(move || validate(Path::new(&repo), Path::new(&cwd)))
+            tokio::task::spawn_blocking(move || validate(Path::new(&repo), Path::new(&cwd), &branch))
                 .await
                 .unwrap_or_else(|e| Err(format!("worktree validation failed: {e}")))
         }
@@ -415,7 +415,7 @@ fn post_tool(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput, event: 
 }
 
 async fn subagent_stop(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInput, seams: &Seams) -> AmmResult<Value> {
-    let (checking, b, repo, limits, report_tool) = {
+    let (checking, b, gate, limits) = {
         let mut amm = lock(state);
         let Some(w) = amm.worker_by_agent(agent_id).filter(|w| w.state == WorkerState::Running) else {
             return Ok(allow());
@@ -430,12 +430,13 @@ async fn subagent_stop(state: &Arc<Mutex<Amm>>, agent_id: &str, input: &HookInpu
         let Some(checking) = amm.mark_checking(&w, input.agent_transcript_path.clone())? else {
             return Ok(allow());
         };
-        let repo = amm.run(&checking.run_id)?.repo;
-        (checking, b, repo, amm.limits.clone(), tool_name("amm_report", &amm.env))
+        let run = amm.run(&checking.run_id)?;
+        let gate = Gate { repo: PathBuf::from(run.repo), integration_head: run.integration_head, report_tool: tool_name("amm_report", &amm.env) };
+        (checking, b, gate, amm.limits.clone())
     };
     let (problems, gated_sha) = {
         let (w, b, limits, diff) = (checking.clone(), b.clone(), limits.clone(), seams.diff.clone());
-        tokio::task::spawn_blocking(move || gate_problems(&w, &b, Path::new(&repo), &limits, &report_tool, &*diff))
+        tokio::task::spawn_blocking(move || gate_problems(&w, &b, &gate, &limits, &*diff))
             .await
             .unwrap_or_else(|e| (vec![format!("amm could not run the done gate: {e}")], None))
     };
@@ -499,15 +500,30 @@ fn branch_head(wt: &str, branch: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// What the gate reads from the run under the lock.
+struct Gate {
+    repo: PathBuf,
+    /// The integration head amm recorded; never the live branch ref, which a worker could move.
+    integration_head: Option<String>,
+    report_tool: String,
+}
+
+/// The commit `sha`'s changes are measured from: the worker's bind-time `base`, or, once the worker has merged
+/// integration work, `merge-base(sha, integration_head)` when that descends from `base`. That is the merge base the
+/// merge queue will use, so exactly the changes it would merge are scope-checked. Errors if git cannot tell.
+fn effective_base(wt: &Path, base: &str, sha: &str, integration_head: Option<&str>) -> Result<String, String> {
+    let Some(head) = integration_head.filter(|h| !h.is_empty()) else { return Ok(base.to_string()) };
+    let mb = git(wt, &["merge-base", "--end-of-options", sha, head])?;
+    let mb_sha = mb.stdout.trim();
+    if mb.code != 0 || mb_sha.is_empty() || mb_sha == base {
+        return Ok(base.to_string());
+    }
+    Ok(if is_ancestor(wt, base, mb_sha)? { mb_sha.to_string() } else { base.to_string() })
+}
+
 /// The done gate's git and check work. Blocking: run it on the blocking pool, without the lock.
-fn gate_problems(
-    w: &Worker,
-    b: &Brief,
-    repo: &Path,
-    limits: &Limits,
-    report_tool: &str,
-    diff: &DiffFn,
-) -> (Vec<String>, Option<String>) {
+fn gate_problems(w: &Worker, b: &Brief, gate: &Gate, limits: &Limits, diff: &DiffFn) -> (Vec<String>, Option<String>) {
+    let (repo, report_tool) = (gate.repo.as_path(), gate.report_tool.as_str());
     let mut problems = Vec::new();
     if b.report.is_none() {
         problems.push(format!("you have not called {report_tool} with token \"{}\"", b.id));
@@ -545,6 +561,14 @@ fn gate_problems(
         problems.push("amm could not read your branch head".into());
         return (problems, None);
     };
+    let base = match effective_base(Path::new(wt), base, &sha, gate.integration_head.as_deref()) {
+        Ok(b) => b,
+        Err(e) => {
+            problems.push(format!("amm could not find your base commit: {}", first_line(&e)));
+            return (problems, None);
+        }
+    };
+    let base = base.as_str();
     match diff(Path::new(wt), base, &sha) {
         Ok(files) => {
             let outside: Vec<String> =
@@ -1101,6 +1125,62 @@ mod tests {
         assert!(git_in(&h.repo, &["diff", "--cached", "--name-only"]).contains("README.md"));
     }
 
+    /// A bound worker whose run has an integration branch holding another brief's lib/other.ts, recorded as amm's
+    /// integration head (as the merge queue leaves it), and a worker that has merged that branch.
+    async fn worker_on_integration() -> (Bound, String) {
+        let (state, main, repo, run, b, dir) = dispatched_in(&[]);
+        let iwt = crate::integration::create_worktree(&main, &run.id, "main").unwrap();
+        std::fs::create_dir_all(iwt.join("lib")).unwrap();
+        std::fs::write(iwt.join("lib/other.ts"), "other\n").unwrap();
+        git_in(&iwt, &["add", "."]);
+        git_in(&iwt, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "other brief"]);
+        let tip = git_in(&iwt, &["rev-parse", "HEAD"]);
+        {
+            let mut amm = state.lock().unwrap();
+            let r = amm.run(&run.id).unwrap();
+            amm.store.put(&Run { integration_head: Some(tip.clone()), ..r }).unwrap();
+        }
+        let h = Bound { state, repo, b, dir };
+        h.hook("PreToolUse", json!({ "tool_name": "mcp__plugin_amm_amm__amm_brief_get", "tool_input": { "token": h.b.id } }))
+            .await;
+        git_in(&h.repo, &["-c", "user.email=t@t", "-c", "user.name=t", "merge", "-q", "--no-edit", &format!("amm/{}", run.id)]);
+        (h, tip)
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_merged_the_integration_branch_passes_with_in_scope_edits() {
+        let (h, tip) = worker_on_integration().await;
+        std::fs::write(h.repo.join("src/b.ts"), "b\n").unwrap();
+        h.report(ReportStatus::Done);
+        let out = h.hook("SubagentStop", json!({})).await;
+        assert_eq!(out, json!({}));
+        let gated = h.worker().gated_sha.unwrap();
+        assert_eq!(git_in(&h.repo, &["merge-base", "--is-ancestor", &tip, &gated]), "");
+        assert_eq!(git_in(&h.repo, &["diff", "--name-only", &tip, &gated]), "src/b.ts");
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_merged_the_integration_branch_still_fails_on_another_brief_file() {
+        let (h, _tip) = worker_on_integration().await;
+        std::fs::write(h.repo.join("lib/other.ts"), "mine now\n").unwrap();
+        h.report(ReportStatus::Done);
+        let out = h.hook("SubagentStop", json!({})).await;
+        assert!(reason(&out).contains("outside your scope: lib/other.ts"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn moving_the_integration_branch_ref_does_not_excuse_out_of_scope_changes() {
+        let h = bound_worker(&[]).await;
+        let run = h.amm().run(&h.b.run_id).unwrap();
+        std::fs::write(h.repo.join("README.md"), "evil\n").unwrap();
+        commit_all(&h.repo, "evil");
+        // The worker points amm/<run> at its own commit, hoping amm takes that as the base.
+        git_in(&h.repo, &["update-ref", &format!("refs/heads/{}", run.integration_branch), "HEAD"]);
+        h.report(ReportStatus::Done);
+        let out = h.hook("SubagentStop", json!({})).await;
+        assert!(reason(&out).contains("outside your scope: README.md"), "{out}");
+    }
+
     fn stop_input() -> HookInput {
         serde_json::from_value(json!({ "session_id": "s", "cwd": "/", "hook_event_name": "SubagentStop", "agent_id": "ag1",
                                        "agent_type": "amm:amm-worker-light" }))
@@ -1206,9 +1286,9 @@ mod tests {
         let seams = {
             let (st, id) = (state.clone(), b.id.clone());
             Seams {
-                validate: Arc::new(move |run_repo, cwd| {
+                validate: Arc::new(move |run_repo, cwd, branch| {
                     st.lock().unwrap().cancel(&id).unwrap();
-                    validate_worktree(run_repo, cwd)
+                    validate_worktree(run_repo, cwd, branch)
                 }),
                 ..Seams::default()
             }
