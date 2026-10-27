@@ -71,3 +71,35 @@ pub fn add_worktree(repo: &Path, name: &str) -> PathBuf {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     dir.canonicalize().unwrap()
 }
+
+/// A clock tests move by hand.
+#[derive(Clone)]
+pub struct ManualClock(std::sync::Arc<std::sync::atomic::AtomicI64>);
+
+impl ManualClock {
+    pub fn new(start: i64) -> Self {
+        ManualClock(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(start)))
+    }
+    pub fn clock(&self) -> crate::types::Clock {
+        let t = self.0.clone();
+        std::sync::Arc::new(move || t.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    pub fn advance(&self, ms: i64) {
+        self.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub struct TestAmm {
+    pub amm: crate::service::Amm,
+    pub clock: ManualClock,
+    pub dir: PathBuf,
+}
+
+/// An Amm on a fresh store in a temp dir, with a manual clock starting at 1_000_000 and an empty env.
+pub fn make_amm(limits: crate::config::Limits) -> TestAmm {
+    let dir = tmp_dir();
+    let clock = ManualClock::new(1_000_000);
+    let store = crate::store::Store::open(&dir.join("amm.db")).expect("store");
+    let amm = crate::service::Amm::new(store, limits, clock.clock(), crate::config::Env::new());
+    TestAmm { amm, clock, dir }
+}
