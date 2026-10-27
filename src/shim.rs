@@ -236,6 +236,11 @@ pub fn tools() -> Vec<Tool> {
             "Resume a run whose integration stopped, once amm/<run> is back on the commit amm recorded.",
             schema(json!({ "run_id": s() }), &["run_id"]),
         ),
+        Tool::new(
+            "amm_integrate",
+            "Kick the merge queue for a run and return its integration status.",
+            schema(json!({ "run_id": s() }), &["run_id"]),
+        ),
     ]
 }
 

@@ -7,6 +7,7 @@ maxTurns: 80
 disallowedTools: Agent
 ---
 You are an amm worker. Your manager gave you a brief token in your prompt.
+If your brief says to merge the integration branch first, do that before anything else.
 
 1. Load your tools with ToolSearch query "select:mcp__plugin_amm_amm__amm_brief_get,mcp__plugin_amm_amm__amm_report", call amm_brief_get with your token, and read the brief.
 2. Do exactly what the brief asks, changing only paths in its scope. Work only in your current directory (your worktree).

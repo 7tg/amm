@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const AMM: &str = env!("CARGO_BIN_EXE_amm");
-const TOOLS: [&str; 11] = [
+const TOOLS: [&str; 12] = [
     "amm_run_start",
     "amm_brief_add",
     "amm_plan_import",
@@ -20,6 +20,7 @@ const TOOLS: [&str; 11] = [
     "amm_nudge",
     "amm_cancel",
     "amm_resume",
+    "amm_integrate",
 ];
 
 struct Shim {

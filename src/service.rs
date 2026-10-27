@@ -563,17 +563,7 @@ impl Amm {
         for r in runs {
             let mut briefs: Vec<Brief> = self.store.all::<Brief>().into_iter().filter(|b| b.run_id == r.id).collect();
             briefs.sort_by_key(|b| b.seq);
-            let count = |s: BriefState| briefs.iter().filter(|b| b.state == s).count();
-            out.push(format!(
-                "run {}: {} briefs · {} queued · {} running · {} done · {} blocked · {} failed",
-                r.id,
-                briefs.len(),
-                count(BriefState::Queued),
-                count(BriefState::Running),
-                count(BriefState::Done),
-                count(BriefState::Blocked),
-                count(BriefState::Failed)
-            ));
+            out.push(self.summary(&r, &briefs));
             if full {
                 for b in &briefs {
                     let calls =
@@ -607,14 +597,57 @@ impl Amm {
                     self.store.put(&Run { status_cursor: last, ..cur })?;
                 }
             }
-            if r.state == RunState::Active && !self.dispatchable(&r.id)?.is_empty() {
-                out.push("  → queued briefs and free slots: call amm_dispatch".into());
-            }
-            if !briefs.is_empty() && briefs.iter().all(|b| matches!(b.state, BriefState::Done | BriefState::Cancelled)) {
-                out.push("  → all briefs done".into());
-            }
+            out.extend(self.hints(&r, &briefs)?);
         }
         Ok(if out.is_empty() { "no active runs".into() } else { out.join("\n") })
+    }
+
+    /// The run's one-line counts. `done` counts briefs that passed their gate and wait to merge (or are merging).
+    fn summary(&self, r: &Run, briefs: &[Brief]) -> String {
+        let count = |s: &[BriefState]| briefs.iter().filter(|b| s.contains(&b.state)).count();
+        format!(
+            "run {}: {} briefs · {} queued · {} running · {} done · {} merged · {} blocked · {} failed",
+            r.id,
+            briefs.len(),
+            count(&[BriefState::Queued]),
+            count(&[BriefState::Running]),
+            count(&[BriefState::Done, BriefState::Merging]),
+            count(&[BriefState::Merged]),
+            count(&[BriefState::Blocked]),
+            count(&[BriefState::Failed])
+        )
+    }
+
+    /// What the manager should do next for a run, if anything.
+    fn hints(&self, r: &Run, briefs: &[Brief]) -> AmmResult<Vec<String>> {
+        let mut out = Vec::new();
+        if r.state == RunState::Active && !self.dispatchable(&r.id)?.is_empty() {
+            out.push("  → queued briefs and free slots: call amm_dispatch".into());
+        }
+        let waiting = briefs.iter().filter(|b| matches!(b.state, BriefState::Done | BriefState::Merging)).count();
+        match r.state {
+            RunState::Done => {
+                let tests = if r.last_test_ok == Some(true) { "tests pass" } else { "tests not run" };
+                out.push(format!("  → run done: {} ({} merges, {tests})", r.integration_branch, r.merges));
+            }
+            RunState::Failed => out.push(format!(
+                "  → integration stopped: put {} back on its recorded commit, then call amm_resume",
+                r.integration_branch
+            )),
+            RunState::Active if waiting > 0 => out.push(format!("  → integrating ({waiting} waiting)")),
+            _ => {}
+        }
+        Ok(out)
+    }
+
+    /// The compact status of one run (counts and next-step hints, no events; the status cursor does not move).
+    pub fn run_summary(&self, run_id: &str) -> AmmResult<String> {
+        let r = self.run(run_id)?;
+        let mut briefs: Vec<Brief> = self.store.all::<Brief>().into_iter().filter(|b| b.run_id == r.id).collect();
+        briefs.sort_by_key(|b| b.seq);
+        let mut out = vec![self.summary(&r, &briefs)];
+        out.extend(self.hints(&r, &briefs)?);
+        Ok(out.join("\n"))
     }
 
     /// Re-reads a worker so callers never write back a stale copy.
@@ -1017,6 +1050,15 @@ fn brief_state_name(s: BriefState) -> &'static str {
     }
 }
 
+/// A string-array detail field as `a, b`.
+fn list(e: &AmmEvent, key: &str) -> String {
+    match e.detail.get(key) {
+        Some(Value::Array(v)) => v.iter().map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).collect::<Vec<_>>().join(", "),
+        Some(v) => v.to_string(),
+        None => "undefined".into(),
+    }
+}
+
 fn describe(e: &AmmEvent) -> String {
     // JS template literals print a missing field as "undefined"; keep that.
     let d = |k: &str| match e.detail.get(k) {
@@ -1030,6 +1072,28 @@ fn describe(e: &AmmEvent) -> String {
         "failed" => format!("{} FAILED at the top tier ({}) → fix the brief or ask the user", d("briefId"), d("reason")),
         "blocked" => format!("{} blocked: {}", d("briefId"), d("notes")),
         "lost" => format!("{} worker lost → requeued", d("briefId")),
+        "merged" => format!("{} merged: {}", d("briefId"), d("title")),
+        "integration_failed" => {
+            let reason = d("reason");
+            let next = if e.detail.get("final") == Some(&Value::Bool(true)) {
+                "fix the brief or ask the user"
+            } else {
+                "call amm_dispatch"
+            };
+            format!("{} integration failed ({}) → {next}", d("briefId"), reason.lines().next().unwrap_or(""))
+        }
+        "conflict" => format!("{} conflict on {} → call amm_dispatch", d("briefId"), list(e, "files")),
+        "scope_violation" => format!(
+            "{} merge would change files outside its scope ({}) → fix the brief or ask the user",
+            d("briefId"),
+            list(e, "files")
+        ),
+        "run_failed" => {
+            let branch = format!("amm/{}", e.run_id.as_deref().unwrap_or(""));
+            format!("integration stopped ({}) → put {branch} back on its recorded commit, then call amm_resume", d("reason"))
+        }
+        "run_done" => format!("run done: {} ({} merges, tests pass)", d("branch"), d("merges")),
+        "integration_error" => format!("{} could not be merged yet ({}); amm retries", d("briefId"), d("error").lines().next().unwrap_or("")),
         kind => {
             let id = if e.detail.contains_key("briefId") { d("briefId") } else { String::new() };
             format!("{id} {kind}").trim().to_string()
@@ -1637,6 +1701,65 @@ mod review_tests {
             })
             .unwrap();
         assert_eq!(run.repo, h.dir.canonicalize().unwrap().to_string_lossy());
+    }
+
+    #[test]
+    fn status_counts_merges_and_shows_the_integration_state() {
+        let (mut h, run) = setup();
+        let amm = &mut h.amm;
+        let a = amm.add_brief(&run.id, light("a", "a/**", &[]), BriefState::Queued).unwrap();
+        let b = amm.add_brief(&run.id, light("b", "b/**", &[]), BriefState::Queued).unwrap();
+        amm.store.put(&Brief { state: BriefState::Merged, ..amm.brief(&a.id).unwrap() }).unwrap();
+        amm.store.put(&Brief { state: BriefState::Done, ..amm.brief(&b.id).unwrap() }).unwrap();
+        let st = amm.status(Some(&run.id), false).unwrap();
+        assert!(st.contains("2 briefs · 0 queued · 0 running · 1 done · 1 merged"), "{st}");
+        assert!(st.contains("→ integrating (1 waiting)"), "{st}");
+        assert!(!st.contains("all briefs done"), "{st}");
+        amm.store.put(&Brief { state: BriefState::Merged, ..amm.brief(&b.id).unwrap() }).unwrap();
+        let r = amm.run(&run.id).unwrap();
+        amm.store.put(&Run { state: RunState::Done, merges: 2, last_test_ok: Some(true), ..r.clone() }).unwrap();
+        let st = amm.status(Some(&run.id), false).unwrap();
+        assert!(st.contains(&format!("→ run done: amm/{} (2 merges, tests pass)", run.id)), "{st}");
+        assert!(!st.contains("integrating"), "{st}");
+        amm.store.put(&Run { state: RunState::Failed, ..r }).unwrap();
+        let st = amm.status(Some(&run.id), false).unwrap();
+        assert!(st.contains("call amm_resume"), "{st}");
+    }
+
+    #[test]
+    fn integration_events_read_as_calls_to_action() {
+        let ev = |kind: &str, detail: Value| AmmEvent {
+            id: 1,
+            ts: 1,
+            run_id: Some("r1".into()),
+            worker_id: None,
+            kind: kind.into(),
+            detail: obj(detail),
+        };
+        let cases = [
+            (ev("merged", serde_json::json!({ "briefId": "b1", "title": "t" })), "b1 merged: t"),
+            (
+                ev("integration_failed", serde_json::json!({ "briefId": "b1", "reason": "`npm test` exited 1:\nboom" })),
+                "b1 integration failed (`npm test` exited 1:) → call amm_dispatch",
+            ),
+            (
+                ev("integration_failed", serde_json::json!({ "briefId": "b1", "reason": "merge failed 3 times: x", "final": true })),
+                "b1 integration failed (merge failed 3 times: x) → fix the brief or ask the user",
+            ),
+            (ev("conflict", serde_json::json!({ "briefId": "b1", "files": ["a.ts", "b.ts"] })), "b1 conflict on a.ts, b.ts → call amm_dispatch"),
+            (
+                ev("scope_violation", serde_json::json!({ "briefId": "b1", "files": ["lib/a.ts"] })),
+                "b1 merge would change files outside its scope (lib/a.ts) → fix the brief or ask the user",
+            ),
+            (
+                ev("run_failed", serde_json::json!({ "reason": "amm/r1 is on x" })),
+                "integration stopped (amm/r1 is on x) → put amm/r1 back on its recorded commit, then call amm_resume",
+            ),
+            (ev("run_done", serde_json::json!({ "branch": "amm/r1", "merges": 2 })), "run done: amm/r1 (2 merges, tests pass)"),
+        ];
+        for (e, want) in cases {
+            assert_eq!(describe(&e), want);
+        }
     }
 
     #[test]

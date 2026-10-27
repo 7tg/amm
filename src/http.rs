@@ -183,7 +183,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// API operations, named after the MCP tools without the "amm_" prefix. Results are kept small on purpose.
-pub const OPS: [&str; 11] = [
+pub const OPS: [&str; 12] = [
     "run_start",
     "brief_add",
     "plan_import",
@@ -195,6 +195,7 @@ pub const OPS: [&str; 11] = [
     "nudge",
     "cancel",
     "resume",
+    "integrate",
 ];
 
 fn args<T: DeserializeOwned>(body: Value) -> AmmResult<T> {
@@ -430,6 +431,13 @@ async fn run_op(s: &AppState, op: &str, body: Value) -> AmmResult<Value> {
             tokio::spawn(crate::integration::integrate(amm.clone(), a.run_id.clone()));
             json!("resumed")
         }
+        "integrate" => {
+            let a: RunIdArgs = args(body)?;
+            let line = lock(amm).run_summary(&a.run_id)?;
+            // Returns at once if the run's queue is already running.
+            tokio::spawn(crate::integration::integrate(amm.clone(), a.run_id.clone()));
+            Value::String(line)
+        }
         "cancel" => {
             let a: CancelArgs = args(body)?;
             lock(amm).cancel(&a.id)?;
@@ -552,6 +560,20 @@ mod tests {
         g(&["reset", "-q", "--hard", &head]);
         run_op(&s, "resume", json!({ "run_id": id })).await.unwrap();
         assert_eq!(lock(&s.amm).run(&id).unwrap().state, crate::types::RunState::Active);
+    }
+
+    #[tokio::test]
+    async fn integrate_kicks_the_queue_and_returns_the_run_status_line() {
+        let repo = crate::testutil::init_repo();
+        let s = app(make_amm(DEFAULT_LIMITS).amm);
+        let id = run_op(&s, "run_start", json!({ "repo": repo, "test_cmd": "true" })).await.unwrap()["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let out = run_op(&s, "integrate", json!({ "run_id": id })).await.unwrap();
+        let line = out.as_str().unwrap();
+        assert!(line.starts_with(&format!("run {id}: 0 briefs")), "{line}");
+        assert!(run_op(&s, "integrate", json!({ "run_id": "nope" })).await.is_err());
     }
 
     #[tokio::test]

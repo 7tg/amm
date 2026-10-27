@@ -570,7 +570,7 @@ impl Amm {
                 self.store.put(&Brief { last_integration_error: Some(e.clone()), notes, ..cur })?;
                 if failed {
                     let reason = format!("merge failed {MAX_INTEGRATION_ERRORS} times: {}", first_line(e));
-                    self.event("integration_failed", Some(run_id), Some(&w.id), json!({ "briefId": b.id, "reason": reason, "tail": e }))?;
+                    self.event("integration_failed", Some(run_id), Some(&w.id), json!({ "briefId": b.id, "reason": reason, "tail": e, "final": true }))?;
                 }
                 Ok(false)
             }

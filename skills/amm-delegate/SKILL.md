@@ -12,6 +12,9 @@ or diffs yourself beyond what you need to write good briefs.
 
 Call `amm_run_start` with `repo` = your current working directory (absolute) and `test_cmd` = the
 repo's full test command (ask the user only if you cannot find it in package.json, Makefile, etc.).
+If a fresh checkout needs dependencies before the tests can run, also pass `setup_cmd` (for example
+`npm ci`, `uv sync` or `bundle install`). amm runs it in the run's integration worktree, where every
+passed brief is merged into `amm/<run>` and tested. If it fails, fix the command and start again.
 
 ## 2. Create briefs
 
@@ -41,4 +44,4 @@ Then run `pwd`. If your working directory changed, `cd` back to the repo root.
 
 ## 4. Supervise
 
-Follow the amm-supervise skill until every brief is done.
+Follow the amm-supervise skill until the status says `→ run done`.

@@ -49,6 +49,10 @@ fn each_worker_agent_pins_its_model_runs_in_a_worktree_and_cannot_spawn_agents()
         }
         assert!(isolation.is_match(&md), "{tier}");
         assert!(no_agents.is_match(&md), "{tier}");
+        assert!(
+            md.contains("If your brief says to merge the integration branch first, do that before anything else."),
+            "{tier}"
+        );
     }
 }
 
@@ -58,6 +62,15 @@ fn skills_have_frontmatter_with_name_and_description() {
         let md = read(&format!("skills/{s}/SKILL.md"));
         assert!(Regex::new(&format!("(?m)^---\\nname: {s}\\ndescription: .+\\n---")).unwrap().is_match(&md), "{s}");
     }
+}
+
+#[test]
+fn the_skills_cover_integration() {
+    let supervise = read("skills/amm-supervise/SKILL.md");
+    for part in ["integration failed", "conflict on", "outside its scope", "integration stopped", "amm_resume", "run done", "never pushes", "amm_integrate"] {
+        assert!(supervise.contains(part), "amm-supervise: {part}");
+    }
+    assert!(read("skills/amm-delegate/SKILL.md").contains("setup_cmd"), "amm-delegate: setup_cmd");
 }
 
 #[test]
