@@ -408,6 +408,25 @@ async fn a_daemon_that_has_not_written_its_lock_yet_is_waited_for() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn unauthenticated_requests_do_not_keep_an_idle_daemon_alive() {
+    let home = common::tmp_dir();
+    let opts = DaemonOpts { home: home.clone(), port: 0, sweep_ms: Some(50), idle_shutdown_ms: Some(150) };
+    let d = run_daemon(opts).await.unwrap().unwrap();
+    let port = d.port();
+    let poke = tokio::spawn(async move {
+        loop {
+            let r = request(port, "GET", "/health", None, "").await;
+            assert!(r.status == 401 || r.status == 0, "{}", r.status);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let shut = tokio::time::timeout(Duration::from_secs(5), d.closed()).await;
+    poke.abort();
+    shut.expect("unauthenticated health checks kept the daemon alive");
+    assert!(read_lock(&home).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_idle_daemon_shuts_down_unless_workers_are_active() {
     let home = common::tmp_dir();
     let opts = DaemonOpts { home: home.clone(), port: 0, sweep_ms: Some(50), idle_shutdown_ms: Some(150) };

@@ -15,13 +15,15 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 pub type DaemonResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const SWEEP_MS: u64 = 30_000;
 const PORT_TRIES: u32 = 20;
+/// Connections served at once; past this, new ones are accepted and dropped.
+const MAX_CONNS: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lock {
@@ -106,6 +108,21 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// Polls the home's lock for a healthy daemon: 5 tries, 200 ms apart.
+async fn wait_healthy(home: &Path) -> bool {
+    for _ in 0..5 {
+        if healthy(read_lock(home)).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    e.sqlite_error_code().is_some_and(|c| matches!(c, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+}
+
 /// Binds the first free port from `start`; `None` if another amm daemon turns out to own this home.
 async fn listen(start: u16, home: &Path) -> DaemonResult<Option<TcpListener>> {
     let end = (u32::from(start) + PORT_TRIES).min(65536);
@@ -114,11 +131,8 @@ async fn listen(start: u16, home: &Path) -> DaemonResult<Option<TcpListener>> {
             return Ok(Some(l));
         }
         // The port holder may be an amm daemon that has not written its lock yet.
-        for _ in 0..5 {
-            if healthy(read_lock(home)).await {
-                return Ok(None);
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        if wait_healthy(home).await {
+            return Ok(None);
         }
     }
     Err(format!("amm: no free port in {start}-{}", end - 1).into())
@@ -145,7 +159,18 @@ pub async fn run_daemon(opts: DaemonOpts) -> DaemonResult<Option<DaemonHandle>> 
     let env: Env = std::env::vars().collect();
     let limits = load_limits(&env);
     let idle_ms = opts.idle_shutdown_ms.unwrap_or(limits.idle_shutdown_ms);
-    let store = Store::open(&home.join("amm.db"))?;
+    let db = home.join("amm.db");
+    let store = match tokio::task::spawn_blocking(move || Store::open(&db)).await? {
+        Ok(s) => s,
+        // Another daemon starting for this home holds the db: if it comes up healthy, step aside quietly.
+        Err(e) if is_busy(&e) => {
+            if wait_healthy(&home).await {
+                return Ok(None);
+            }
+            return Err(e.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
     let clock: Clock = Arc::new(now_ms);
     let amm = Arc::new(Mutex::new(Amm::new(store, limits, clock, env)));
     let token = hex(&rand::random::<[u8; 16]>());
@@ -176,7 +201,9 @@ pub async fn run_daemon(opts: DaemonOpts) -> DaemonResult<Option<DaemonHandle>> 
             let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             loop {
                 tick.tick().await;
-                let idle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (amm, last_activity) = (amm.clone(), last_activity.clone());
+                // Sweeping writes to sqlite: keep it off the async workers. A panic surfaces as a JoinError.
+                let idle = tokio::task::spawn_blocking(move || {
                     let mut a = amm.lock().unwrap_or_else(|e| e.into_inner());
                     match a.sweep() {
                         Err(e) => {
@@ -188,14 +215,15 @@ pub async fn run_daemon(opts: DaemonOpts) -> DaemonResult<Option<DaemonHandle>> 
                                 && a.active_workers(None).is_empty()
                         }
                     }
-                }));
+                })
+                .await;
                 match idle {
                     Ok(true) => {
                         shutdown.send_replace(true);
                         return;
                     }
                     Ok(false) => {}
-                    Err(_) => eprintln!("amm: sweep failed: panic"),
+                    Err(e) => eprintln!("amm: sweep failed: {e}"),
                 }
             }
         })
@@ -218,6 +246,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> DaemonResult<Option<DaemonHandle>> 
 /// Accepts connections until shutdown, then drops every connection still open (in-flight requests included).
 async fn serve(listener: TcpListener, app: axum::Router, mut shutdown: watch::Receiver<bool>) {
     let mut conns = JoinSet::new();
+    let permits = Arc::new(Semaphore::new(MAX_CONNS));
     loop {
         while conns.try_join_next().is_some() {}
         let stream = tokio::select! {
@@ -232,8 +261,13 @@ async fn serve(listener: TcpListener, app: axum::Router, mut shutdown: watch::Re
                 }
             },
         };
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
         let svc = TowerToHyperService::new(app.clone());
         conns.spawn(async move {
+            let _permit = permit;
             let conn = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
                 .serve_connection(TokioIo::new(stream), svc);

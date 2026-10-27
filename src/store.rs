@@ -85,8 +85,9 @@ impl Store {
         }
         let db = Connection::open(file)?;
         let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
-        db.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+        // Busy timeout first: switching to WAL needs a lock another daemon may briefly hold.
         db.busy_timeout(Duration::from_millis(5000))?;
+        db.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         for t in [Run::TABLE, Brief::TABLE, Worker::TABLE, Session::TABLE] {
             db.execute_batch(&format!(
                 "CREATE TABLE IF NOT EXISTS {t} (id TEXT PRIMARY KEY, data TEXT NOT NULL)"

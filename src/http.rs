@@ -22,6 +22,8 @@ use tower_http::catch_panic::CatchPanicLayer;
 pub const MAX_BODY: usize = 1_000_000;
 /// Largest plan file `plan_import` reads.
 pub const MAX_PLAN: u64 = 5_000_000;
+/// Longest a request body may take to arrive.
+pub const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -88,7 +90,14 @@ async fn read_json(req: Request) -> Result<Value, Box<Response>> {
         return Err(Box::new(too_large()));
     }
     // DefaultBodyLimit bounds this read, also for bodies of unknown length.
-    let bytes = match Bytes::from_request(req, &()).await {
+    // A client that stalls mid-body must not hold its connection (and a slot) forever.
+    let read = tokio::time::timeout(BODY_TIMEOUT, Bytes::from_request(req, &())).await;
+    let Ok(read) = read else {
+        let mut r = error(StatusCode::REQUEST_TIMEOUT, "body timeout");
+        r.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
+        return Err(Box::new(r));
+    };
+    let bytes = match read {
         Ok(b) => b,
         Err(r) if r.status() == StatusCode::PAYLOAD_TOO_LARGE => return Err(Box::new(too_large())),
         Err(r) => return Err(Box::new(error(StatusCode::BAD_REQUEST, r.body_text()))),
