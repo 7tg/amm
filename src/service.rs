@@ -209,8 +209,6 @@ pub struct Amm {
     pub status_limit: i64,
     /// Runs whose merge queue is running in this process (see `integration::integrate`).
     pub merging: std::collections::HashSet<String>,
-    /// Main-session transcript paths by session id, from hook input. In memory: every amm tool call refreshes it.
-    pub session_transcripts: std::collections::HashMap<String, String>,
 }
 
 impl Amm {
@@ -229,7 +227,7 @@ impl Amm {
             let remaining = (w.last_event_at + limits.lease_ms + extra - t).max(1);
             sem.try_acquire("workers", &w.id, UNBOUNDED, remaining);
         }
-        Amm { store, sem, limits, now, env, status_limit: 10000, merging: Default::default(), session_transcripts: Default::default() }
+        Amm { store, sem, limits, now, env, status_limit: 10000, merging: Default::default() }
     }
 
     fn t(&self) -> i64 {
@@ -1005,12 +1003,10 @@ impl Amm {
 
     pub fn touch_session(&mut self, id: &str, cwd: &str, transcript_path: Option<&str>) -> AmmResult<()> {
         let now = self.t();
-        if let Some(p) = transcript_path.filter(|p| !p.is_empty()) {
-            self.session_transcripts.insert(id.to_string(), p.to_string());
-        }
+        let path = transcript_path.filter(|p| !p.is_empty()).map(str::to_string);
         let next = match self.store.get::<Session>(id) {
-            Some(s) => Session { last_seen: now, ..s },
-            None => Session { id: id.to_string(), cwd: cwd.to_string(), first_seen: now, last_seen: now },
+            Some(s) => Session { last_seen: now, transcript_path: path.or(s.transcript_path.clone()), ..s },
+            None => Session { id: id.to_string(), cwd: cwd.to_string(), first_seen: now, last_seen: now, transcript_path: path },
         };
         self.store.put(&next)?;
         Ok(())
@@ -1637,6 +1633,22 @@ mod review_tests {
         let w = amm.worker_for_brief(&b.id).unwrap();
         let sha = w.base_sha.unwrap();
         assert!(sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()), "{sha}");
+    }
+
+    #[test]
+    fn transcript_path_survives_restart_and_is_not_cleared() {
+        let (mut h, _run, _b, _repo) = started(DEFAULT_LIMITS);
+        h.amm.touch_session("s1", "/w", Some("/t/s1.jsonl")).unwrap();
+        h.amm.touch_session("s1", "/w", None).unwrap();
+        h.amm.touch_session("s1", "/w", Some("")).unwrap();
+        let amm2 = Amm::new(h.amm.store, DEFAULT_LIMITS, h.clock.clock(), Env::new());
+        assert_eq!(amm2.store.get::<Session>("s1").unwrap().transcript_path.as_deref(), Some("/t/s1.jsonl"));
+    }
+
+    #[test]
+    fn old_session_json_without_transcript_path_loads() {
+        let s: Session = serde_json::from_str(r#"{"id":"a","cwd":"/c","firstSeen":1,"lastSeen":2}"#).unwrap();
+        assert_eq!(s.transcript_path, None);
     }
 
     #[test]
