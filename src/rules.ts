@@ -44,6 +44,10 @@ export function messageFor(rule: string, ctx: RuleContext): string {
   }
 }
 
+function forget(c: Counters, rule: string): void {
+  c.firedRules = c.firedRules.filter((r) => r !== rule);
+}
+
 /** Updates the worker's counters for one tool call and decides whether to correct or escalate. */
 export function evaluate(c: Counters, e: ToolEvent, ctx: RuleContext): { counters: Counters; verdict: Verdict } {
   const next: Counters = {
@@ -55,8 +59,11 @@ export function evaluate(c: Counters, e: ToolEvent, ctx: RuleContext): { counter
   };
   const cmd = e.tool === 'Bash' ? String(e.input.command ?? '') : null;
   const passedCheck = cmd !== null && !e.failed && ctx.checks.includes(cmd);
-  next.sinceProgress = (isEditTool(e.tool) && !e.failed) || passedCheck ? 0 : c.sinceProgress + 1;
+  const progressed = (isEditTool(e.tool) && !e.failed) || passedCheck;
+  next.sinceProgress = progressed ? 0 : c.sinceProgress + 1;
+  if (progressed) forget(next, 'no-progress');
   if (cmd !== null) {
+    if (cmd !== c.lastCmd || !e.failed) forget(next, 'repeat-failure');
     if (e.failed) {
       next.lastCmdFails = cmd === c.lastCmd ? c.lastCmdFails + 1 : 1;
       next.lastCmd = cmd;

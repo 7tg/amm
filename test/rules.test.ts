@@ -22,7 +22,7 @@ const read = (): ToolEvent => ({ tool: 'Read', input: { file_path: 'a' }, failed
 const edit = (): ToolEvent => ({ tool: 'Edit', input: { file_path: 'a' }, failed: false });
 
 test('same command failing 3 times triggers a correction, then escalation', () => {
-  const first = feed([bash('make'), bash('make'), bash('make', true), bash('make', true), bash('make', true)].slice(2));
+  const first = feed([bash('make', true), bash('make', true), bash('make', true)]);
   assert.equal(first.verdicts.at(-1)!.kind, 'correct');
   const again = feed([bash('make', true), bash('make', true), bash('make', true)], first.counters);
   assert.deepEqual(again.verdicts.at(-1), { kind: 'escalate', rule: 'repeat-failure' });
@@ -51,4 +51,35 @@ test('budget fires once at 80% of maxTurns and never escalates', () => {
   const budget = r.verdicts.filter((v) => v.kind !== 'ok');
   assert.equal(budget.length, 1);
   assert.equal((budget[0] as { rule: string }).rule, 'budget');
+});
+
+test('a success between failures resets the repeat counter', () => {
+  const r = feed([bash('make', true), bash('make', true), bash('make'), bash('make', true), bash('make', true)]);
+  assert.ok(r.verdicts.every((v) => v.kind === 'ok'));
+  const next = evaluate(r.counters, bash('make', true), ctx);
+  assert.equal(next.verdict.kind, 'correct');
+});
+
+test('no-progress forgets it fired after an edit', () => {
+  const r = feed([...Array.from({ length: 8 }, read), edit(), ...Array.from({ length: 8 }, read)]);
+  const kinds = r.verdicts.map((v) => v.kind);
+  assert.equal(kinds.filter((k) => k === 'correct').length, 2);
+  assert.ok(!kinds.includes('escalate'));
+});
+
+test('no-progress escalates when it fires again without recovery', () => {
+  const r = feed(Array.from({ length: 16 }, read));
+  assert.deepEqual(r.verdicts.at(-1), { kind: 'escalate', rule: 'no-progress' });
+});
+
+test('a failed edit does not count as progress', () => {
+  const failedEdit: ToolEvent = { tool: 'Edit', input: { file_path: 'a' }, failed: true };
+  const r = feed([...Array.from({ length: 7 }, read), failedEdit]);
+  assert.equal((r.verdicts.at(-1) as { rule: string }).rule, 'no-progress');
+});
+
+test('repeat-failure forgets it fired after a different command runs', () => {
+  const first = feed([bash('make', true), bash('make', true), bash('make', true), bash('ls')]);
+  const again = feed([bash('make', true), bash('make', true), bash('make', true)], first.counters);
+  assert.equal(again.verdicts.at(-1)!.kind, 'correct');
 });
