@@ -127,3 +127,17 @@ test('worktreeInfo describes a worktree', async () => {
   assert.match(info.head, /^[0-9a-f]{40}$/);
   assert.equal((await worktreeInfo(main)).toplevel, fs.realpathSync(main));
 });
+
+test('runChecks enforces an overall budget', async () => {
+  const t0 = Date.now();
+  const rs = await runChecks(['sleep 0.3', 'echo second', 'echo third'], os.tmpdir(), 5_000, 100);
+  assert.ok(Date.now() - t0 < 2_000);
+  assert.equal(rs[0].timedOut, true);
+  assert.equal(rs.at(-1)!.ok, false);
+});
+
+test('runChecks marks checks after the budget as timed out without running them', async () => {
+  const rs = await runChecks(['sleep 0.15', 'echo second'], os.tmpdir(), 5_000, 100);
+  assert.equal(rs.at(-1)!.timedOut, true);
+  assert.doesNotMatch(rs.at(-1)!.output, /second/);
+});

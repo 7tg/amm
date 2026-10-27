@@ -67,11 +67,17 @@ export function runCheck(cmd: string, cwd: string, timeoutMs: number): Promise<C
   });
 }
 
-/** Runs checks in order and stops at the first failure. */
-export async function runChecks(cmds: string[], cwd: string, timeoutMs: number): Promise<CheckResult[]> {
+/** Runs checks in order and stops at the first failure. Each check gets at most `timeoutMs` and what is left of
+ * `budgetMs` for the whole list; once the budget is used up the next check counts as timed out without running. */
+export async function runChecks(cmds: string[], cwd: string, timeoutMs: number, budgetMs = Infinity): Promise<CheckResult[]> {
+  const deadline = Date.now() + budgetMs;
   const results: CheckResult[] = [];
   for (const cmd of cmds) {
-    const r = await runCheck(cmd, cwd, timeoutMs);
+    const left = deadline - Date.now();
+    const r =
+      left <= 0
+        ? { cmd, ok: false, code: null, timedOut: true, output: 'gate time budget used up before this check ran' }
+        : await runCheck(cmd, cwd, Math.min(timeoutMs, left));
     results.push(r);
     if (!r.ok) break;
   }

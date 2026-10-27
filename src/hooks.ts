@@ -1,7 +1,8 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { runChecks } from './checks.ts';
 import { toolName } from './config.ts';
-import { changedFiles, git } from './git.ts';
+import { changedFiles, git, worktreeInfo } from './git.ts';
 import { evaluate, isEditTool } from './rules.ts';
 import { inScope } from './scope.ts';
 import type { Amm } from './service.ts';
@@ -62,15 +63,24 @@ export async function handleHook(amm: Amm, event: string, input: HookInput): Pro
 async function preTool(amm: Amm, input: HookInput): Promise<HookOutput> {
   const tool = input.tool_name ?? '';
   const ti = input.tool_input ?? {};
-  if (tool.endsWith('amm_brief_get') && typeof ti.token === 'string') {
-    const root = (await git(input.cwd, ['rev-parse', '--show-toplevel'])).stdout.trim() || input.cwd;
-    await amm.bind(ti.token, input.agent_id!, root);
+  const isWorker = input.agent_type?.includes('amm-worker') ?? false;
+  let found = amm.workerByAgent(input.agent_id!);
+  if (!found && isWorker) {
+    if (tool.endsWith('amm_brief_get') && typeof ti.token === 'string') {
+      const bound = await amm.bind(ti.token, input.agent_id!, input.cwd);
+      if ('error' in bound) return deny(`amm: ${bound.error}. Work from the worktree amm created for you.`);
+      found = bound.worker;
+    } else if (tool !== 'ToolSearch' && !tool.endsWith('amm_brief_get')) {
+      return deny('amm: fetch your brief first with amm_brief_get');
+    }
   }
-  const found = amm.workerByAgent(input.agent_id!);
   if (!found) return allow();
   if (found.state === 'cancelled') return deny('amm: your manager cancelled this brief. Stop now and reply CANCELLED.');
   if (['escalated', 'lost', 'done', 'blocked'].includes(found.state)) {
     return deny('amm: this brief was reassigned or is finished. Stop now and reply REASSIGNED.');
+  }
+  if (tool.includes('amm_') && typeof ti.token === 'string' && ti.token !== found.briefId) {
+    return deny('amm: that token belongs to another brief. Use only your own token.');
   }
   const w = amm.touchWorker(found);
   const correction = amm.takeCorrection(w);
@@ -83,14 +93,30 @@ async function preTool(amm: Amm, input: HookInput): Promise<HookOutput> {
   return allow();
 }
 
+/** realpath of the nearest existing ancestor plus the remaining segments; follows dangling symlinks. */
+export function resolveReal(p: string, depth = 0): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    // not fully resolvable: fall through
+  }
+  try {
+    if (fs.lstatSync(p).isSymbolicLink() && depth < 40) return resolveReal(path.resolve(path.dirname(p), fs.readlinkSync(p)), depth + 1);
+  } catch {
+    // does not exist
+  }
+  const parent = path.dirname(p);
+  return parent === p ? p : path.join(resolveReal(parent, depth), path.basename(p));
+}
+
 export function forbidden(w: Worker, b: Brief, tool: string, ti: Record<string, unknown>): string | null {
   if (tool === 'Agent' || tool === 'Task') return 'amm: workers may not spawn agents. Do the work yourself or report "blocked".';
-  if (tool === 'Bash' && /\bgit\s+push\b/.test(String(ti.command ?? ''))) {
+  if (tool === 'Bash' && /\bgit\b[^;&|\n]*\b(push|send-pack)\b/.test(String(ti.command ?? ''))) {
     return 'amm: workers may not push. Your manager merges your branch.';
   }
   if (isEditTool(tool) && w.worktree) {
     const file = String(ti.file_path ?? ti.notebook_path ?? '');
-    const abs = path.resolve(w.worktree, file);
+    const abs = resolveReal(path.resolve(w.worktree, file));
     const rel = path.relative(w.worktree, abs);
     if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return `amm: ${file} is outside your worktree (${w.worktree}). Edit only inside it.`;
     if (rel === '.git' || rel.startsWith('.git' + path.sep)) return 'amm: workers may not edit .git.';
@@ -166,11 +192,28 @@ async function subagentStop(amm: Amm, input: HookInput): Promise<HookOutput> {
 async function gateProblems(amm: Amm, w: Worker, b: Brief): Promise<string[]> {
   const problems: string[] = [];
   if (!b.report) problems.push(`you have not called ${toolName('amm_report')} with token "${b.id}"`);
-  if (!w.worktree || !w.baseSha) {
-    problems.push('amm could not determine your worktree base commit, so your changes cannot be scope-checked');
+  let sound = false;
+  if (!w.worktree || !w.baseSha || !fs.existsSync(w.worktree)) {
+    problems.push('amm could not find your worktree or its base commit, so your changes cannot be scope-checked');
   } else {
     try {
-      const outside = (await changedFiles(w.worktree, w.baseSha)).filter((f) => !inScope(path.join(w.worktree!, f), w.worktree!, b.scope));
+      const [mine, repo] = await Promise.all([worktreeInfo(w.worktree), worktreeInfo(amm.run(w.runId).repo)]);
+      if (mine.toplevel !== w.worktree || mine.commonDir !== repo.commonDir) problems.push('your worktree is no longer a worktree of the repository (was .git removed or replaced?)');
+      else if (mine.branch !== w.branch) problems.push(`your worktree is on branch ${mine.branch ?? '(detached)'}, not ${w.branch}. Switch back`);
+      else sound = true;
+    } catch (e) {
+      problems.push(`amm could not inspect your worktree: ${(e as Error).message.split('\n')[0]}`);
+    }
+  }
+  // Checks first, so files they touch are part of the scope check below.
+  if (w.worktree && fs.existsSync(w.worktree)) {
+    for (const r of await runChecks(b.checks, w.worktree, amm.limits.checkTimeoutMs, amm.limits.gateBudgetMs)) {
+      if (!r.ok) problems.push(`check \`${r.cmd}\` ${r.timedOut ? 'timed out' : `exited ${r.code}`}:\n${r.output.slice(-1500)}`);
+    }
+  }
+  if (sound) {
+    try {
+      const outside = (await changedFiles(w.worktree!, w.baseSha!)).filter((f) => !inScope(path.join(w.worktree!, f), w.worktree!, b.scope));
       if (outside.length) {
         problems.push(`files changed outside your scope: ${outside.join(', ')}. Revert them and describe the needed change in amm_report instead`);
       }
@@ -178,9 +221,6 @@ async function gateProblems(amm: Amm, w: Worker, b: Brief): Promise<string[]> {
       // Fail closed: an unreadable worktree must not pass the gate.
       problems.push(`amm could not list your changed files: ${(e as Error).message.split('\n')[0]}`);
     }
-  }
-  for (const r of await runChecks(b.checks, w.worktree ?? '.', amm.limits.checkTimeoutMs)) {
-    if (!r.ok) problems.push(`check \`${r.cmd}\` ${r.timedOut ? 'timed out' : `exited ${r.code}`}:\n${r.output.slice(-1500)}`);
   }
   return problems;
 }
