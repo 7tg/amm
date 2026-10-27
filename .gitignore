@@ -3,3 +3,6 @@ node_modules/
 .amm/
 target/
 bin/*/
+bin/.host
+bin/.lock/
+bin/.download.*/

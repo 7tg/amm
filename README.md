@@ -20,8 +20,9 @@ amm is one Rust binary, `amm` (`daemon` | `shim` | `hook <Event>`). The plugin r
 `bin/amm`, a small sh launcher. On first use, and after a version bump, the launcher fetches the
 release binary for your platform (Linux or macOS, x86_64 or arm64) into `bin/<target>/` with
 `gh release download`. The repo is private, so this needs `gh auth login`. Without `gh`, or
-without a matching release, it builds the binary with `cargo build --release` instead (Rust 1.88+).
-While the binary is missing, hooks fail open: they never block the agent.
+without a matching release, it builds the binary with `cargo build --release` instead (Rust 1.88+) and installs it under
+`bin/<host triple>/`. Only `shim`, `daemon` and `--version` install; a hook never downloads, builds
+or waits, and while the binary is missing it fails open, so it never blocks the agent.
 
 ## Use
 
@@ -33,7 +34,7 @@ Ask the main session to delegate a goal or a plan file ("delegate this plan with
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
-cargo build --release   # target/release/amm; copy it to bin/<target>/amm, or let bin/amm do it
+cargo build --release   # target/release/amm; bin/amm installs it on its next shim start
 ```
 
 Keep the version in `Cargo.toml` equal to the one in `.claude-plugin/plugin.json` (a test checks

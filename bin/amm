@@ -1,6 +1,7 @@
 #!/bin/sh
-# amm launcher: runs bin/<target>/amm, fetching or building it first when it is missing or stale.
-# A `hook` call never fails: if the binary cannot be had, it prints one line to stderr and exits 0.
+# amm launcher: runs the amm binary for this platform, fetching or building it first when it is
+# missing or stale. A `hook` call never installs and never waits: without a current binary it
+# prints one line to stderr and exits 0, so it cannot block the agent.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
@@ -13,68 +14,76 @@ fail() {
   exit 1
 }
 
+# TARGET names the release archive; HOST_GUESS is where a cargo build of this platform usually lands.
 case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64 | Linux-amd64) TARGET=x86_64-unknown-linux-musl ;;
-  Linux-aarch64 | Linux-arm64) TARGET=aarch64-unknown-linux-musl ;;
-  Darwin-x86_64) TARGET=x86_64-apple-darwin ;;
-  Darwin-arm64 | Darwin-aarch64) TARGET=aarch64-apple-darwin ;;
+  Linux-x86_64 | Linux-amd64) TARGET=x86_64-unknown-linux-musl HOST_GUESS=x86_64-unknown-linux-gnu ;;
+  Linux-aarch64 | Linux-arm64) TARGET=aarch64-unknown-linux-musl HOST_GUESS=aarch64-unknown-linux-gnu ;;
+  Darwin-x86_64) TARGET=x86_64-apple-darwin HOST_GUESS=$TARGET ;;
+  Darwin-arm64 | Darwin-aarch64) TARGET=aarch64-apple-darwin HOST_GUESS=$TARGET ;;
   *) fail "unsupported platform $(uname -s) $(uname -m)" ;;
 esac
 
-DIR="$ROOT/bin/$TARGET"
-BIN="$DIR/amm"
 VERSION=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ROOT/.claude-plugin/plugin.json" | head -n 1)
 [ -n "$VERSION" ] || fail "no version in $ROOT/.claude-plugin/plugin.json"
 
-current() {
-  [ -x "$BIN" ] && [ "$("$BIN" --version 2>/dev/null)" = "amm $VERSION" ]
+# Sets BIN to the first current binary: the release one, then a cargo build (bin/.host names its triple).
+find_bin() {
+  for t in "$TARGET" "$HOST_GUESS" "$(cat "$ROOT/bin/.host" 2>/dev/null)"; do
+    [ -n "$t" ] || continue
+    BIN="$ROOT/bin/$t/amm"
+    [ -x "$BIN" ] && [ "$("$BIN" --version 2>/dev/null)" = "amm $VERSION" ] && return 0
+  done
+  return 1
 }
 
 # Every output goes to stderr: for `shim`, stdout is the MCP channel.
 install() {
-  mkdir -p "$DIR" || return 1
+  dir="$ROOT/bin/$TARGET"
   if command -v gh >/dev/null 2>&1; then
-    tmp="$DIR/.download.$$"
-    rm -rf "$tmp" && mkdir "$tmp" || return 1
-    if gh release download "v$VERSION" -R 7tg/amm -p "amm-$TARGET.tar.gz" -O - 2>/dev/null | tar -xz -C "$tmp" 2>/dev/null &&
-      [ -f "$tmp/amm" ] && chmod 755 "$tmp/amm" && mv -f "$tmp/amm" "$BIN"; then
+    tmp="$ROOT/bin/.download.$$"
+    rm -rf "$tmp"
+    if mkdir "$tmp" &&
+      gh release download "v$VERSION" -R 7tg/amm -p "amm-$TARGET.tar.gz" -O - 2>/dev/null | tar -xz -C "$tmp" 2>/dev/null &&
+      [ -f "$tmp/amm" ] && chmod 755 "$tmp/amm" && mkdir -p "$dir" && mv -f "$tmp/amm" "$dir/amm"; then
       rm -rf "$tmp"
-      current && return 0
+      find_bin && return 0
     fi
     rm -rf "$tmp"
   fi
   if command -v cargo >/dev/null 2>&1; then
+    host=$(rustc -vV 2>/dev/null | sed -n 's/host: //p')
+    [ -n "$host" ] || host=$HOST_GUESS
+    dir="$ROOT/bin/$host"
     echo "amm: building v$VERSION with cargo (no release binary for $TARGET)" >&2
-    cargo build --release --manifest-path "$ROOT/Cargo.toml" 1>&2 &&
-      cp "$ROOT/target/release/amm" "$BIN.tmp.$$" && mv -f "$BIN.tmp.$$" "$BIN" && current && return 0
-    rm -f "$BIN.tmp.$$"
+    if cargo build --release --manifest-path "$ROOT/Cargo.toml" 1>&2 && mkdir -p "$dir" &&
+      cp "$ROOT/target/release/amm" "$dir/amm.tmp.$$" && mv -f "$dir/amm.tmp.$$" "$dir/amm"; then
+      echo "$host" >"$ROOT/bin/.host"
+      find_bin && return 0
+    fi
+    rm -f "$dir/amm.tmp.$$"
   fi
   return 1
 }
 
-if ! current; then
+if ! find_bin; then
+  [ "$HOOK" = 1 ] && fail "no amm v$VERSION binary yet; skipping this hook"
   LOCK="$ROOT/bin/.lock"
-  waited=0
-  # A mkdir lock keeps parallel hooks from racing; a holder that died leaves its pid behind.
+  # A mkdir lock keeps parallel installs from racing; a holder that died leaves its pid behind.
   until mkdir "$LOCK" 2>/dev/null; do
     holder=$(cat "$LOCK/pid" 2>/dev/null || true)
     if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
       rm -rf "$LOCK"
       continue
     fi
-    if [ "$HOOK" = 1 ] && [ "$waited" -ge 20 ]; then
-      fail "amm binary is being installed; skipping this hook"
-    fi
     sleep 0.1 2>/dev/null || sleep 1
-    waited=$((waited + 1))
   done
   echo $$ >"$LOCK/pid"
   trap 'rm -rf "$LOCK"' EXIT
   trap 'exit 1' HUP INT TERM
-  current || install
+  find_bin || install
   rm -rf "$LOCK"
   trap - EXIT HUP INT TERM
-  current || fail "cannot get the amm v$VERSION binary for $TARGET: no release download (gh) and no cargo"
+  find_bin || fail "cannot get the amm v$VERSION binary for $TARGET: no release download (gh) and no cargo"
 fi
 
 exec "$BIN" "$@"
