@@ -27,7 +27,7 @@ export function readLock(home = ammHome()): Lock | null {
 export async function isHealthy(lock: Lock | null): Promise<boolean> {
   if (!lock) return false;
   try {
-    const r = await fetch(`http://127.0.0.1:${lock.port}/health`, { signal: AbortSignal.timeout(1000) });
+    const r = await fetch(`http://127.0.0.1:${lock.port}/health`, { headers: { 'x-amm-token': lock.token }, signal: AbortSignal.timeout(1000) });
     return r.ok && ((await r.json()) as { pid: number }).pid === lock.pid;
   } catch {
     return false;
@@ -60,9 +60,12 @@ async function listen(server: http.Server, start: number, home: string): Promise
 export async function runDaemon(opts: { home?: string; port?: number } = {}): Promise<{ port: number; close: () => Promise<void> } | null> {
   const home = opts.home ?? ammHome();
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.chmodSync(home, 0o700);
   if (await isHealthy(readLock(home))) return null;
   const limits = loadLimits();
-  const store = new Store(path.join(home, 'amm.db'));
+  const dbPath = path.join(home, 'amm.db');
+  if (!fs.existsSync(dbPath)) fs.closeSync(fs.openSync(dbPath, 'a', 0o600));
+  const store = new Store(dbPath);
   const amm = new Amm(store, limits);
   const token = crypto.randomBytes(16).toString('hex');
   let lastActivity = Date.now();
@@ -74,20 +77,28 @@ export async function runDaemon(opts: { home?: string; port?: number } = {}): Pr
     store.close();
     return null;
   }
-  fs.writeFileSync(lockPath(home), JSON.stringify({ pid: process.pid, port, token } satisfies Lock), { mode: 0o600 });
+  const tmp = `${lockPath(home)}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, port, token } satisfies Lock), { mode: 0o600 });
+  fs.renameSync(tmp, lockPath(home));
 
   let closed = false;
   const close = async () => {
     if (closed) return;
     closed = true;
     clearInterval(timer);
-    await new Promise<void>((r) => server.close(() => r()));
+    const done = new Promise<void>((r) => server.close(() => r()));
+    server.closeAllConnections();
+    await done;
     store.close();
     if (readLock(home)?.pid === process.pid && readLock(home)?.port === port) fs.rmSync(lockPath(home), { force: true });
   };
   const timer = setInterval(() => {
-    amm.sweep();
-    if (Date.now() - lastActivity > limits.idleShutdownMs && amm.activeWorkers().length === 0) void close();
+    try {
+      amm.sweep();
+      if (Date.now() - lastActivity > limits.idleShutdownMs && amm.activeWorkers().length === 0) void close();
+    } catch (e) {
+      console.error('amm: sweep failed:', e);
+    }
   }, 30_000);
   timer.unref();
   return { port, close };

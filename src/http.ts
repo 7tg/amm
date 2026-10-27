@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import http from 'node:http';
 import { handleHook, type HookInput } from './hooks.ts';
 import type { Amm } from './service.ts';
@@ -33,26 +34,61 @@ export const OPS: Record<string, (amm: Amm, a: Args) => unknown> = {
   },
 };
 
+const MAX_BODY = 1_000_000;
+
+function tokenOk(given: string | string[] | undefined, token: string): boolean {
+  if (typeof given !== 'string') return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(token);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 export function createServer(amm: Amm, token: string, onActivity: () => void): http.Server {
-  return http.createServer(async (req, res) => {
-    onActivity();
+  const handle = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const send = (code: number, body: unknown) => {
       res.writeHead(code, { 'content-type': 'application/json' });
       res.end(JSON.stringify(body));
     };
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-    if (req.method === 'GET' && url.pathname === '/health') return send(200, { ok: true, pid: process.pid });
-    if (req.headers['x-amm-token'] !== token) return send(401, { error: 'bad token' });
-    let raw = '';
-    for await (const chunk of req) raw += chunk;
     try {
+      const port = req.socket.localPort;
+      if (req.headers.host !== `127.0.0.1:${port}` && req.headers.host !== `localhost:${port}`) return send(403, { error: 'bad host' });
+      if (!tokenOk(req.headers['x-amm-token'], token)) return send(401, { error: 'bad token' });
+      onActivity();
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      if (req.method === 'GET' && url.pathname === '/health') return send(200, { ok: true, pid: process.pid });
+      const chunks: Buffer[] = [];
+      let size = 0;
+      for await (const chunk of req) {
+        size += (chunk as Buffer).length;
+        if (size > MAX_BODY) {
+          res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
+          res.end(JSON.stringify({ error: 'body too large' }), () => req.destroy());
+          return;
+        }
+        chunks.push(chunk as Buffer);
+      }
+      const raw = Buffer.concat(chunks).toString('utf8');
       const body = raw ? JSON.parse(raw) : {};
       const [, kind, name] = url.pathname.split('/');
-      if (req.method === 'POST' && kind === 'api' && name in OPS) return send(200, { result: await OPS[name](amm, body) });
+      if (req.method === 'POST' && kind === 'api' && Object.hasOwn(OPS, name)) return send(200, { result: await OPS[name](amm, body) });
       if (req.method === 'POST' && kind === 'hook') return send(200, await handleHook(amm, name, body as HookInput));
       send(404, { error: 'not found' });
     } catch (e) {
-      send(400, { error: (e as Error).message });
+      if (res.headersSent) res.destroy();
+      else send(400, { error: (e as Error).message });
     }
+  };
+  return http.createServer((req, res) => {
+    handle(req, res).catch(() => {
+      if (res.headersSent) req.socket.destroy();
+      else {
+        try {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end('{"error":"internal"}');
+        } catch {
+          req.socket.destroy();
+        }
+      }
+    });
   });
 }
