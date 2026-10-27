@@ -2,7 +2,7 @@
 //! checks run on the blocking pool with the lock released (see the plan's Concurrency section).
 use crate::checks::run_checks;
 use crate::config::{Limits, tool_name};
-use crate::git::{changed_files, git, worktree_info};
+use crate::git::{changed_files, commit_all, committed_files, git, is_ancestor, worktree_info};
 use crate::rules::{Counters, RuleContext, ToolEvent, Verdict, evaluate, is_edit_tool};
 use crate::scope::in_scope;
 use crate::service::{AmmResult, BindClaim, WorktreeCheck, validate_worktree};
@@ -563,7 +563,59 @@ fn gate_problems(
     if branch_head(wt, branch).as_deref() != Some(sha.as_str()) {
         problems.push(format!("after the checks: your branch {branch} moved while amm checked it. Finish again"));
     }
-    (problems, Some(sha))
+    if !problems.is_empty() {
+        return (problems, None);
+    }
+    match commit_work(w, b, wt, base, branch, &sha, repo) {
+        Ok(gated) => (problems, Some(gated)),
+        Err(p) => {
+            problems.push(p);
+            (problems, None)
+        }
+    }
+}
+
+/// Commits the scope-checked worktree as amm and returns the commit to gate. Everything is verified again on the
+/// commit itself, since a process that outlived the checks may have written after the scope check: the branch must
+/// sit on the new commit, which descends from both `sha` (the commit that was scope-checked) and `base`, and every
+/// file it changes since `base` must be in scope. A commit that fails these checks is taken back off the branch.
+fn commit_work(w: &Worker, b: &Brief, wt: &str, base: &str, branch: &str, sha: &str, repo: &Path) -> Result<String, String> {
+    let root = Path::new(wt);
+    let new = commit_all(root, &format!("amm({}): {}", b.id, b.title))
+        .map_err(|e| format!("amm could not commit your changes: {}", first_line(&e)))?;
+    if new == sha {
+        return Ok(new);
+    }
+    let verified = (|| {
+        if let Some(p) = verify_worktree(w, repo) {
+            return Err(format!("after the commit: {p}"));
+        }
+        if branch_head(wt, branch).as_deref() != Some(new.as_str()) {
+            return Err(format!("after the commit: your branch {branch} moved while amm committed it. Finish again"));
+        }
+        let descends = is_ancestor(root, sha, &new).and_then(|a| Ok(a && is_ancestor(root, base, &new)?));
+        match descends {
+            Ok(true) => {}
+            Ok(false) => return Err("after the commit: amm's commit does not descend from your base commit".into()),
+            Err(e) => return Err(format!("amm could not verify its commit: {}", first_line(&e))),
+        }
+        let files = committed_files(root, base, &new).map_err(|e| format!("amm could not verify its commit: {}", first_line(&e)))?;
+        let outside: Vec<String> =
+            files.into_iter().filter(|f| !in_scope(&root.join(f).to_string_lossy(), wt, &b.scope)).collect();
+        if !outside.is_empty() {
+            return Err(format!(
+                "files changed outside your scope: {}. Revert them and describe the needed change in amm_report instead",
+                outside.join(", ")
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(p) = verified {
+        // Undo amm's commit only if the branch still points at it; the changes stay staged in the worktree.
+        let _ = git(root, &["update-ref", "-m", "amm: undo gate commit", &format!("refs/heads/{branch}"), sha, &new]);
+        return Err(p);
+    }
+    Ok(new)
 }
 
 #[cfg(test)]
@@ -961,6 +1013,92 @@ mod tests {
         assert_eq!(w.gated_sha, Some(git_in(&h.repo, &["rev-parse", w.branch.as_deref().unwrap()])));
     }
 
+
+    #[tokio::test]
+    async fn the_gate_commits_the_in_scope_work_as_amm_and_gates_that_commit() {
+        let h = bound_worker(&[]).await;
+        let base = h.worker().base_sha.unwrap();
+        std::fs::write(h.repo.join("src/a.ts"), "changed\n").unwrap();
+        std::fs::write(h.repo.join("src/b.ts"), "b\n").unwrap();
+        h.report(ReportStatus::Done);
+        assert_eq!(h.hook("SubagentStop", json!({})).await, json!({}));
+        let w = h.worker();
+        let head = git_in(&h.repo, &["rev-parse", &format!("refs/heads/{}", w.branch.as_deref().unwrap())]);
+        assert_eq!(w.gated_sha.as_deref(), Some(head.as_str()));
+        assert_ne!(head, base);
+        let meta = git_in(&h.repo, &["log", "-1", "--format=%an <%ae>|%cn <%ce>|%P|%s", &head]);
+        assert_eq!(meta, format!("amm <amm@localhost>|amm <amm@localhost>|{base}|amm({}): t", h.b.id));
+        let files = git_in(&h.repo, &["show", "--name-only", "--format=", &head]);
+        assert_eq!(files.lines().collect::<Vec<_>>(), ["src/a.ts", "src/b.ts"]);
+        assert_eq!(git_in(&h.repo, &["status", "--porcelain"]), "");
+    }
+
+    #[tokio::test]
+    async fn a_gate_on_a_clean_tree_makes_no_empty_commit() {
+        let h = bound_worker(&[]).await;
+        let base = h.worker().base_sha.unwrap();
+        h.report(ReportStatus::Done);
+        assert_eq!(h.hook("SubagentStop", json!({})).await, json!({}));
+        assert_eq!(git_in(&h.repo, &["rev-parse", "HEAD"]), base);
+        assert_eq!(h.worker().gated_sha, Some(base));
+    }
+
+    #[tokio::test]
+    async fn the_gate_commit_runs_no_planted_hook_or_signer() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = bound_worker(&[]).await;
+        let marker = crate::testutil::tmp_dir().join("ran");
+        let hooks = crate::testutil::tmp_dir();
+        for name in ["pre-commit", "commit-msg", "post-commit"] {
+            let f = hooks.join(name);
+            std::fs::write(&f, format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display())).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        git_in(&h.repo, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        git_in(&h.repo, &["config", "commit.gpgsign", "true"]);
+        git_in(&h.repo, &["config", "gpg.program", hooks.join("pre-commit").to_str().unwrap()]);
+        std::fs::write(h.repo.join("src/b.ts"), "b\n").unwrap();
+        h.report(ReportStatus::Done);
+        assert_eq!(h.hook("SubagentStop", json!({})).await, json!({}));
+        assert!(!marker.exists(), "a planted hook or signer ran");
+        let head = git_in(&h.repo, &["rev-parse", "HEAD"]);
+        assert_eq!(h.worker().gated_sha, Some(head.clone()));
+        assert_eq!(git_in(&h.repo, &["log", "-1", "--format=%an|%G?", &head]), "amm|N");
+    }
+
+    #[tokio::test]
+    async fn a_failed_commit_fails_the_gate() {
+        let h = bound_worker(&[]).await;
+        std::fs::write(h.repo.join("src/b.ts"), "b\n").unwrap();
+        let gitdir = git_in(&h.repo, &["rev-parse", "--absolute-git-dir"]);
+        std::fs::write(Path::new(&gitdir).join("index.lock"), "").unwrap();
+        h.report(ReportStatus::Done);
+        let out = h.hook("SubagentStop", json!({})).await;
+        assert_eq!(out["decision"], "block");
+        assert!(reason(&out).contains("amm could not commit your changes"), "{out}");
+        assert_eq!(h.amm().brief(&h.b.id).unwrap().state, BriefState::Running);
+    }
+
+    #[tokio::test]
+    async fn an_out_of_scope_file_written_after_the_scope_check_is_never_gated() {
+        let h = bound_worker(&[]).await;
+        std::fs::write(h.repo.join("src/b.ts"), "b\n").unwrap();
+        h.report(ReportStatus::Done);
+        let seams = with_diff(|root, base, sha| {
+            let files = crate::git::changed_files(root, base, sha);
+            // A worker process that outlived the checks writes outside its scope once the scope check has read the tree.
+            std::fs::write(root.join("README.md"), "evil\n").unwrap();
+            files
+        });
+        let out = handle_with(&h.state, "SubagentStop", stop_input(), seams).await.unwrap();
+        assert_eq!(out["decision"], "block");
+        assert!(reason(&out).contains("outside your scope: README.md"), "{out}");
+        assert_eq!(h.worker().gated_sha, None);
+        assert_ne!(h.amm().brief(&h.b.id).unwrap().state, BriefState::Done);
+        // amm's commit is taken back off the branch; the changes stay staged.
+        assert_eq!(git_in(&h.repo, &["rev-parse", "HEAD"]), h.worker().base_sha.unwrap());
+        assert!(git_in(&h.repo, &["diff", "--cached", "--name-only"]).contains("README.md"));
+    }
 
     fn stop_input() -> HookInput {
         serde_json::from_value(json!({ "session_id": "s", "cwd": "/", "hook_event_name": "SubagentStop", "agent_id": "ag1",

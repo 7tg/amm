@@ -193,6 +193,54 @@ pub fn changed_files(root: &Path, base_sha: &str, sha: &str) -> Result<Vec<Strin
     Ok(out)
 }
 
+/// Name and email amm commits under.
+pub const AMM_IDENT: (&str, &str) = ("amm", "amm@localhost");
+
+/// Stages every change in the worktree `root` (`git add -A`) and commits it as `amm <amm@localhost>`, with no hook,
+/// signing, filter or automatic gc. Returns the new HEAD; on a clean tree it returns HEAD and makes no commit.
+/// Blocking. Errors if any git call fails or times out.
+pub fn commit_all(root: &Path, message: &str) -> Result<String, String> {
+    let mut env = no_filters(root)?;
+    let (name, email) = AMM_IDENT;
+    for who in ["AUTHOR", "COMMITTER"] {
+        env.push((format!("GIT_{who}_NAME"), name.into()));
+        env.push((format!("GIT_{who}_EMAIL"), email.into()));
+    }
+    raw_env(root, &["add", "-A", "--", "."], &env)?;
+    let staged = run(root, &["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"], &env, MAX_OUTPUT, GIT_TIMEOUT)?;
+    if staged.code > 1 {
+        return Err(format!("git diff failed: {}", staged.stderr.trim()));
+    }
+    if staged.code == 1 {
+        let cfg = ["-c", "commit.gpgsign=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false"];
+        let ident = [format!("user.name={name}"), format!("user.email={email}")];
+        let args: Vec<&str> = cfg
+            .iter()
+            .copied()
+            .chain(ident.iter().flat_map(|i| ["-c", i.as_str()]))
+            .chain(["commit", "-q", "--no-verify", "--no-gpg-sign", "-m", message])
+            .collect();
+        raw_env(root, &args, &env)?;
+    }
+    Ok(raw_env(root, &["rev-parse", "--verify", "HEAD^{commit}"], &env)?.trim().to_string())
+}
+
+/// Files that differ between the commits `base_sha` and `sha` (trees only, no working tree). Errors if git fails.
+pub fn committed_files(root: &Path, base_sha: &str, sha: &str) -> Result<Vec<String>, String> {
+    let out = raw(root, &["diff", "--name-only", "-z", "--no-renames", "--no-textconv", "--no-ext-diff", base_sha, sha, "--"])?;
+    Ok(out.split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect())
+}
+
+/// Whether commit `a` is an ancestor of (or equal to) commit `b`. Errors if git cannot tell.
+pub fn is_ancestor(root: &Path, a: &str, b: &str) -> Result<bool, String> {
+    let r = git(root, &["merge-base", "--is-ancestor", "--end-of-options", a, b])?;
+    match r.code {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => Err(format!("git merge-base failed: {}", r.stderr.trim())),
+    }
+}
+
 fn raw_env(cwd: &Path, args: &[&str], env: &[(String, String)]) -> Result<String, String> {
     let r = run(cwd, args, env, MAX_OUTPUT, GIT_TIMEOUT)?;
     if r.code != 0 {
@@ -408,6 +456,63 @@ mod tests {
         let e = git_timeout(&dir, &["diff", "--name-only", "HEAD"], std::time::Duration::from_millis(300)).unwrap_err();
         assert!(e.contains("timed out"), "{e}");
         assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    fn show(dir: &Path, fmt: &str) -> String {
+        git(dir, &["log", "-1", &format!("--format={fmt}")]).unwrap().stdout.trim().to_string()
+    }
+
+    #[test]
+    fn commit_all_commits_every_change_as_amm_and_returns_the_new_head() {
+        let dir = repo();
+        let base = head(&dir);
+        fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        fs::write(dir.join("new.txt"), "n\n").unwrap();
+        let sha = commit_all(&dir, "amm(b1): t").unwrap();
+        assert_eq!(sha, head(&dir));
+        assert_ne!(sha, base);
+        assert_eq!(show(&dir, "%an <%ae>|%cn <%ce>|%s|%P"), format!("amm <amm@localhost>|amm <amm@localhost>|amm(b1): t|{base}"));
+        let files = git(&dir, &["show", "--name-only", "--format=", &sha]).unwrap().stdout;
+        assert_eq!(sorted(files.lines().map(str::to_string).collect()), ["a.txt", "new.txt"]);
+        assert_eq!(git(&dir, &["status", "--porcelain"]).unwrap().stdout, "");
+    }
+
+    #[test]
+    fn commit_all_on_a_clean_tree_returns_head_without_a_commit() {
+        let dir = repo();
+        let base = head(&dir);
+        assert_eq!(commit_all(&dir, "m").unwrap(), base);
+        assert_eq!(head(&dir), base);
+    }
+
+    #[test]
+    fn commit_all_runs_no_planted_hook_signer_or_filter() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = repo();
+        let marker = tmp_dir().join("ran");
+        let hooks = tmp_dir();
+        for name in ["pre-commit", "commit-msg", "post-commit", "prepare-commit-msg"] {
+            let p = hooks.join(name);
+            fs::write(&p, format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display())).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::copy(hooks.join("pre-commit"), dir.join(".git/hooks/pre-commit")).unwrap();
+        git_in(&dir, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        git_in(&dir, &["config", "commit.gpgsign", "true"]);
+        git_in(&dir, &["config", "gpg.program", hooks.join("pre-commit").to_str().unwrap()]);
+        plant_filter(&dir, &marker, &format!("touch {}; cat", marker.display()));
+        let sha = commit_all(&dir, "m").unwrap();
+        assert_eq!(sha, head(&dir));
+        assert_eq!(show(&dir, "%G?"), "N");
+        assert!(!marker.exists(), "a planted hook, signer or filter ran");
+    }
+
+    #[test]
+    fn commit_all_errors_when_git_cannot_commit() {
+        let dir = repo();
+        fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        fs::write(dir.join(".git/index.lock"), "").unwrap();
+        assert!(commit_all(&dir, "m").is_err());
     }
 
     #[test]
