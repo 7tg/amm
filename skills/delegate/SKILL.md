@@ -1,6 +1,6 @@
 ---
-name: amm-delegate
-description: Use when the user asks to delegate, parallelize or hand off implementation work to agents, or invokes /amm:amm-delegate. Turns a goal or an existing plan file into amm briefs and dispatches cheaper worker agents in isolated worktrees.
+name: delegate
+description: Use when the user asks to delegate, parallelize or hand off implementation work to agents, or invokes /amm:delegate. Turns a goal or an existing plan file into amm briefs and dispatches cheaper worker agents in isolated worktrees.
 ---
 
 # Delegate work through amm
@@ -44,4 +44,4 @@ Then run `pwd`. If your working directory changed, `cd` back to the repo root.
 
 ## 4. Supervise
 
-Follow the amm-supervise skill until the status says `→ run done`.
+Follow the supervise skill (/amm:supervise) until the status says `→ run done`.

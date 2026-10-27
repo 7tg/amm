@@ -27,7 +27,7 @@ or waits, and while the binary is missing it fails open, so it never blocks the 
 ## Use
 
 Ask the main session to delegate a goal or a plan file ("delegate this plan with amm"), or invoke
-`/amm:amm-delegate`.
+`/amm:delegate`.
 
 ## Develop
 

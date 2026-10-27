@@ -58,7 +58,7 @@ fn each_worker_agent_pins_its_model_runs_in_a_worktree_and_cannot_spawn_agents()
 
 #[test]
 fn skills_have_frontmatter_with_name_and_description() {
-    for s in ["amm-delegate", "amm-supervise"] {
+    for s in ["delegate", "supervise"] {
         let md = read(&format!("skills/{s}/SKILL.md"));
         assert!(Regex::new(&format!("(?m)^---\\nname: {s}\\ndescription: .+\\n---")).unwrap().is_match(&md), "{s}");
     }
@@ -66,11 +66,11 @@ fn skills_have_frontmatter_with_name_and_description() {
 
 #[test]
 fn the_skills_cover_integration() {
-    let supervise = read("skills/amm-supervise/SKILL.md");
+    let supervise = read("skills/supervise/SKILL.md");
     for part in ["integration failed", "conflict on", "outside its scope", "integration stopped", "amm_resume", "run done", "never pushes", "amm_integrate"] {
-        assert!(supervise.contains(part), "amm-supervise: {part}");
+        assert!(supervise.contains(part), "supervise: {part}");
     }
-    assert!(read("skills/amm-delegate/SKILL.md").contains("setup_cmd"), "amm-delegate: setup_cmd");
+    assert!(read("skills/delegate/SKILL.md").contains("setup_cmd"), "delegate: setup_cmd");
 }
 
 #[test]

@@ -1,5 +1,5 @@
 ---
-name: amm-supervise
+name: supervise
 description: Use while an amm run is active, whenever a background amm worker finishes, or when the user asks how delegated work is going. Keeps the manager's token use minimal by acting only on amm_status deltas.
 ---
 
@@ -11,7 +11,7 @@ Each time an amm worker's background task completes, or the user asks for progre
    completion message is not needed.
 2. Act only on the lines it returns:
    - `→ call amm_dispatch` or `escalated …`: call `amm_dispatch` and launch every returned Agent call
-     exactly as in amm-delegate step 3.
+     exactly as in the delegate skill, step 3.
    - `blocked: <notes>`: decide. Either fix the brief (`amm_brief_update` with a better goal or
      scope, `ready: true`, then dispatch) or ask the user if the notes need a decision only they can make.
    - `FAILED at the top tier`: read the brief's notes with `amm_status` `full: true`, then rewrite or
