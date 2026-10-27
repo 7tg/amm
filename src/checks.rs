@@ -16,11 +16,31 @@ pub struct CheckResult {
 const OUTPUT_TAIL: usize = 4000;
 const GRACE: Duration = Duration::from_millis(200);
 const POLL_SLICE_MS: i32 = 20;
+/// After a timeout kill, how long we wait for the leader to die before giving up on it.
+const KILL_WAIT: Duration = Duration::from_secs(2);
 
 fn kill_group(pid: u32) {
     // SAFETY: plain syscall; a negative pid addresses the process group. ESRCH (already gone) is ignored.
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+fn kill_pid(pid: u32) {
+    // SAFETY: plain syscall on our own child; it is not reaped yet, so the pid cannot have been reused.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+/// True once the child has exited, without reaping it (WNOWAIT), so its pid and pgid stay ours until we kill the group.
+fn has_exited(pid: u32) -> bool {
+    // SAFETY: waitid fills a zeroed siginfo_t; with WNOHANG it leaves si_pid 0 while the child still runs.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let r = libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT);
+        // On error (e.g. already reaped) fall through to try_wait, which reports the real state.
+        r != 0 || info.si_pid() != 0
     }
 }
 
@@ -156,23 +176,31 @@ pub fn run_check(cmd: &str, cwd: &Path, timeout_ms: u64) -> CheckResult {
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut timed_out = false;
+    let mut kill_at: Option<Instant> = None;
+    let mut gave_up = false;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Ok(st),
-            Ok(None) => {}
-            Err(e) => break Err(e),
+        if has_exited(pid) {
+            // Kill the group while the zombie leader still pins the pgid, and only then reap.
+            kill_group(pid);
+            break child.wait();
         }
         let now = Instant::now();
         if !timed_out && now >= deadline {
             // The flag is set only if the child had not exited by the time the timer fired.
-            match child.try_wait() {
-                Ok(Some(st)) => break Ok(st),
-                Ok(None) => {
-                    timed_out = true;
-                    kill_group(pid);
-                }
-                Err(e) => break Err(e),
+            if has_exited(pid) {
+                continue;
             }
+            timed_out = true;
+            kill_at = Some(now);
+            kill_group(pid);
+            // The leader may have left its own group (setsid); kill it directly too.
+            kill_pid(pid);
+        }
+        if let Some(k) = kill_at
+            && now.duration_since(k) >= KILL_WAIT
+        {
+            gave_up = true;
+            break Ok(std::process::ExitStatus::default());
         }
         let slice = if timed_out {
             POLL_SLICE_MS
@@ -181,7 +209,14 @@ pub fn run_check(cmd: &str, cwd: &Path, timeout_ms: u64) -> CheckResult {
         };
         pump(&mut streams, &mut tail, slice);
     };
-    kill_group(pid);
+    if gave_up {
+        // Never leave a zombie behind: reap in the background once it finally dies.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    } else {
+        kill_group(pid);
+    }
     let grace_end = Instant::now() + GRACE;
     while streams.iter().any(|s| s.fd.is_some()) {
         let left = grace_end.saturating_duration_since(Instant::now());
@@ -196,6 +231,7 @@ pub fn run_check(cmd: &str, cwd: &Path, timeout_ms: u64) -> CheckResult {
         }
     }
     match status {
+        Ok(_) if gave_up => CheckResult { cmd: cmd.to_string(), ok: false, code: None, timed_out: true, output: tail },
         Ok(st) => {
             let code = st.code();
             CheckResult { cmd: cmd.to_string(), ok: code == Some(0) && !timed_out, code, timed_out, output: tail }
@@ -341,5 +377,16 @@ mod tests {
     fn run_check_replaces_genuinely_invalid_bytes() {
         let r = run_check("printf 'a\\377b'", tmp(), 5_000);
         assert_eq!(r.output, "a\u{fffd}b");
+    }
+
+    #[test]
+    fn run_check_returns_promptly_when_the_timeout_hits_a_stubborn_child() {
+        if Command::new("sh").args(["-c", "command -v setsid"]).output().map(|o| !o.status.success()).unwrap_or(true) {
+            return;
+        }
+        let t = Instant::now();
+        let r = run_check("setsid sh -c 'trap \"\" TERM; sleep 30' & wait", tmp(), 200);
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_eq!((r.ok, r.timed_out), (false, true));
     }
 }
