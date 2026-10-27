@@ -157,13 +157,14 @@ struct Snapshot {
 
 fn snapshot(amm: &Mutex<Amm>) -> Snapshot {
     let a = lock(amm);
+    let sessions: Vec<Session> = a.store.all();
     Snapshot {
         now: (a.now)(),
         runs: a.store.all(),
         briefs: a.store.all(),
         workers: a.store.all(),
-        sessions: a.store.all(),
-        transcripts: a.session_transcripts.clone(),
+        transcripts: sessions.iter().filter_map(|s| Some((s.id.clone(), s.transcript_path.clone()?))).collect(),
+        sessions,
     }
 }
 
@@ -251,7 +252,8 @@ async fn worker_detail(State(s): State<AppState>, UrlPath(id): UrlPath<String>) 
                     .store
                     .get::<Run>(&w.run_id)
                     .and_then(|r| r.session_id)
-                    .and_then(|sid| a.session_transcripts.get(&sid).cloned());
+                    .and_then(|sid| a.store.get::<Session>(&sid))
+                    .and_then(|s| s.transcript_path);
                 let filter = EventFilter { worker_id: Some(w.id.clone()), limit: Some(10_000), ..Default::default() };
                 let events = a.store.events(&filter);
                 Some((w, brief, session, events))

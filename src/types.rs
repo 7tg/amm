@@ -163,6 +163,8 @@ pub struct Session {
     pub cwd: String,
     pub first_seen: i64,
     pub last_seen: i64,
+    #[serde(default)]
+    pub transcript_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

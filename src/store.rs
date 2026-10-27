@@ -226,6 +226,7 @@ mod tests {
             cwd: cwd.into(),
             first_seen: 1,
             last_seen: last,
+            transcript_path: None,
         }
     }
     fn ev(
@@ -424,7 +425,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&data).unwrap();
         let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         keys.sort();
-        assert_eq!(keys, ["cwd", "firstSeen", "id", "lastSeen"]);
+        assert_eq!(keys, ["cwd", "firstSeen", "id", "lastSeen", "transcriptPath"]);
         let jm: String =
             s.db.query_row("PRAGMA journal_mode", [], |r| r.get(0))
                 .unwrap();
