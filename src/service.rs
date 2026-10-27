@@ -127,11 +127,12 @@ pub struct WorktreeCheck {
     pub base_sha: String,
 }
 
-/// Bind phase 2, run without `Amm`: checks that `cwd` is an agent worktree of `run_repo` and finds its base commit:
-/// `merge-base(HEAD, refs/heads/<integration_branch>)`, or `merge-base(HEAD, <run_repo HEAD>)` when that is newer or
-/// the integration branch is missing (runs from before integration). Both are ancestors of the worker's HEAD, which
-/// the worker cannot have touched yet, so neither can excuse a change it makes later.
-pub fn validate_worktree(run_repo: &Path, cwd: &Path, integration_branch: &str) -> Result<WorktreeCheck, String> {
+/// Bind phase 2, run without `Amm`: checks that `cwd` is an agent worktree of `run_repo` and finds its base commit,
+/// `merge-base(HEAD, integration_head)`. `integration_head` is the commit amm recorded for the run, read under the
+/// lock: never a live ref (the base branch or `amm/<run>`), which another worker could have moved. If the base branch
+/// moved during the run, its new commits count as the worker's changes, so the gate fails closed. Errors when there is
+/// no recorded head (runs from before integration) or no single merge base.
+pub fn validate_worktree(run_repo: &Path, cwd: &Path, integration_head: Option<&str>) -> Result<WorktreeCheck, String> {
     let first_line = |e: String| e.lines().next().unwrap_or("").to_string();
     let repo = worktree_info(run_repo).map_err(first_line)?;
     let info = worktree_info(cwd).map_err(first_line)?;
@@ -147,33 +148,17 @@ pub fn validate_worktree(run_repo: &Path, cwd: &Path, integration_branch: &str) 
             return Err(format!("branch {} is not a worktree-agent-* branch", other.as_deref().unwrap_or("(detached)")));
         }
     };
-    let merge_base = |other: &str| -> Result<Option<String>, String> {
-        let mb = git(&info.toplevel, &["merge-base", "--end-of-options", "HEAD", other]).map_err(first_line)?;
-        let sha = mb.stdout.trim();
-        Ok((mb.code == 0 && !sha.is_empty()).then(|| sha.to_string()))
+    let Some(head) = integration_head.filter(|h| !h.is_empty()) else {
+        return Err("could not determine the base commit: the run has no integration head".into());
     };
-    let main = merge_base(&repo.head)?;
-    let integration = if integration_branch.is_empty() {
-        None
-    } else {
-        let r = git(&info.toplevel, &["rev-parse", "--verify", "-q", "--end-of-options", &format!("refs/heads/{integration_branch}^{{commit}}")])
-            .map_err(first_line)?;
-        match r.stdout.trim() {
-            tip if r.code == 0 && !tip.is_empty() => merge_base(tip)?,
-            _ => None,
+    let mb = git(&info.toplevel, &["merge-base", "--all", "--end-of-options", "HEAD", head]).map_err(first_line)?;
+    let bases: Vec<&str> = mb.stdout.split_whitespace().collect();
+    match bases[..] {
+        [sha] if mb.code == 0 => {
+            Ok(WorktreeCheck { toplevel: info.toplevel.to_string_lossy().into_owned(), branch, base_sha: sha.to_string() })
         }
-    };
-    let sha = match (integration, main) {
-        (Some(i), Some(m)) => {
-            // The integration fork point, unless the main checkout moved past it since the run started.
-            let newer = git(&info.toplevel, &["merge-base", "--is-ancestor", "--end-of-options", &i, &m]).map_err(first_line)?;
-            if newer.code == 0 && i != m { m } else { i }
-        }
-        (Some(i), None) => i,
-        (None, Some(m)) => m,
-        (None, None) => return Err("could not determine the base commit".into()),
-    };
-    Ok(WorktreeCheck { toplevel: info.toplevel.to_string_lossy().into_owned(), branch, base_sha: sha })
+        _ => Err("could not determine the base commit".into()),
+    }
 }
 
 /// The real path of `path` when it exists, else `path` as given. Touches the filesystem; call it without the lock.
@@ -719,7 +704,7 @@ impl Amm {
                 let check = self
                     .run(&w.run_id)
                     .map_err(|e| e.0)
-                    .and_then(|r| validate_worktree(Path::new(&r.repo), cwd, &r.integration_branch));
+                    .and_then(|r| validate_worktree(Path::new(&r.repo), cwd, r.integration_head.as_deref()));
                 self.finish_bind(&w.id, agent_id, check)
             }
         }
@@ -1170,6 +1155,7 @@ mod lifecycle_tests {
                 repo: repo.to_string_lossy().into_owned(),
                 test_cmd: "npm test".into(),
                 base_branch: "main".into(),
+                integration_head: Some(crate::git::worktree_info(&repo).unwrap().head),
                 ..Default::default()
             })
             .unwrap();
@@ -1225,9 +1211,9 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn bind_bases_on_the_integration_branch_and_falls_back_to_the_repo_head_without_one() {
+    fn bind_bases_on_the_recorded_integration_head_never_on_live_refs() {
         let (h, run, _b, repo) = started(DEFAULT_LIMITS);
-        let main_head = crate::git::worktree_info(&repo).unwrap().head;
+        let recorded = h.amm.run(&run.id).unwrap().integration_head.unwrap();
         let iwt = crate::integration::create_worktree(&repo, &run.id, "main").unwrap();
         std::fs::write(iwt.join("merged.txt"), "m\n").unwrap();
         git(&iwt, &["add", "."]);
@@ -1237,9 +1223,13 @@ mod lifecycle_tests {
         let wt = wt(&repo);
         git(&wt, &["merge", "-q", "--ff-only", &run.integration_branch]);
         let repo_path = Path::new(&h.amm.run(&run.id).unwrap().repo).to_path_buf();
-        assert_eq!(validate_worktree(&repo_path, &wt, &run.integration_branch).unwrap().base_sha, tip);
-        assert_eq!(validate_worktree(&repo_path, &wt, "").unwrap().base_sha, main_head);
-        assert_eq!(validate_worktree(&repo_path, &wt, "amm/missing").unwrap().base_sha, main_head);
+        assert_eq!(validate_worktree(&repo_path, &wt, Some(&tip)).unwrap().base_sha, tip);
+        // The live refs do not count: only the recorded head does.
+        assert_eq!(validate_worktree(&repo_path, &wt, Some(&recorded)).unwrap().base_sha, recorded);
+        git(&repo, &["update-ref", "refs/heads/main", &tip]);
+        assert_eq!(validate_worktree(&repo_path, &wt, Some(&recorded)).unwrap().base_sha, recorded);
+        // A run with no recorded head (from before integration) cannot bind.
+        assert!(validate_worktree(&repo_path, &wt, None).unwrap_err().contains("base commit"));
     }
 
     #[test]
@@ -1330,7 +1320,7 @@ mod lifecycle_tests {
             panic!("expected a fresh claim");
         };
         amm.cancel(&b.id).unwrap();
-        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &wt, "");
+        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &wt, amm.run(&run.id).unwrap().integration_head.as_deref());
         assert!(check.is_ok());
         assert_eq!(amm.finish_bind(&w.id, "agent-1", check).unwrap_err(), "brief was cancelled");
         let after = amm.store.get::<Worker>(&w.id).unwrap();
@@ -1348,7 +1338,7 @@ mod lifecycle_tests {
         let wt = wt(&repo);
         let BindClaim::Claimed(w) = amm.claim_bind(&b.id, "agent-1", &wt).unwrap() else { panic!("claim") };
         amm.store.put(&Worker { agent_id: Some("agent-2".into()), ..w.clone() }).unwrap();
-        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &wt, "");
+        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &wt, amm.run(&run.id).unwrap().integration_head.as_deref());
         let e = amm.finish_bind(&w.id, "agent-1", check).unwrap_err();
         assert!(e.contains("another agent"), "{e}");
         let after = amm.store.get::<Worker>(&w.id).unwrap();
@@ -1363,7 +1353,7 @@ mod lifecycle_tests {
         let BindClaim::Claimed(w) = h.amm.claim_bind(&b.id, "agent-1", &wt).unwrap() else { panic!("claim") };
         h.clock.advance(1001);
         h.amm.sweep().unwrap();
-        let check = validate_worktree(Path::new(&h.amm.run(&run.id).unwrap().repo), &wt, "");
+        let check = validate_worktree(Path::new(&h.amm.run(&run.id).unwrap().repo), &wt, h.amm.run(&run.id).unwrap().integration_head.as_deref());
         assert_eq!(h.amm.finish_bind(&w.id, "agent-1", check).unwrap_err(), "worker lost");
         assert_eq!(h.amm.store.get::<Worker>(&w.id).unwrap().base_sha, None);
     }
@@ -1396,7 +1386,7 @@ mod lifecycle_tests {
             panic!("expected a fresh claim");
         };
         amm.cancel(&b.id).unwrap();
-        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &repo, "");
+        let check = validate_worktree(Path::new(&amm.run(&run.id).unwrap().repo), &repo, amm.run(&run.id).unwrap().integration_head.as_deref());
         assert!(amm.finish_bind(&w.id, "agent-1", check).is_err());
         assert_eq!(amm.store.all::<Worker>()[0].state, WorkerState::Cancelled);
     }
@@ -1497,13 +1487,13 @@ mod review_tests {
         // Both claims land before either validation finishes, as with two in-flight binds.
         let c1 = amm.claim_bind(&b.id, "a1", &wt1);
         let c2 = amm.claim_bind(&b.id, "a2", &wt2);
-        let run_repo = amm.run(&run.id).unwrap().repo;
+        let (run_repo, head) = { let r = amm.run(&run.id).unwrap(); (r.repo, r.integration_head) };
         let mut results = Vec::new();
         for (c, cwd) in [(c1, &wt1), (c2, &wt2)] {
             results.push(match c {
                 Ok(BindClaim::Claimed(w)) => {
                     let agent = w.agent_id.clone().unwrap();
-                    amm.finish_bind(&w.id, &agent, validate_worktree(Path::new(&run_repo), cwd, ""))
+                    amm.finish_bind(&w.id, &agent, validate_worktree(Path::new(&run_repo), cwd, head.as_deref()))
                 }
                 Ok(BindClaim::Bound(w)) => Ok(w),
                 Err(e) => Err(e),

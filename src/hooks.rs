@@ -83,13 +83,13 @@ fn log_err(what: &str, e: impl std::fmt::Display) {
     eprintln!("amm: {what}: {e}");
 }
 
-type ValidateFn = dyn Fn(&Path, &Path, &str) -> Result<WorktreeCheck, String> + Send + Sync;
+type ValidateFn = dyn Fn(&Path, &Path, Option<&str>) -> Result<WorktreeCheck, String> + Send + Sync;
 type DiffFn = dyn Fn(&Path, &str, &str) -> Result<Vec<String>, String> + Send + Sync;
 
 /// The blocking work the handlers delegate, swappable in tests to land a cancel or a branch move mid-flight.
 #[derive(Clone)]
 pub(crate) struct Seams {
-    /// Bind phase 2: `validate_worktree(run_repo, cwd, integration_branch)`.
+    /// Bind phase 2: `validate_worktree(run_repo, cwd, integration_head)`.
     pub validate: Arc<ValidateFn>,
     /// The gate's diff: `changed_files(root, base_sha, sha)`.
     pub diff: Arc<DiffFn>,
@@ -166,15 +166,15 @@ async fn bind(state: &Arc<Mutex<Amm>>, brief_id: &str, agent_id: &str, cwd: &str
         match amm.claim_bind(brief_id, agent_id, Path::new(cwd))? {
             BindClaim::Bound(w) => return Ok(w),
             BindClaim::Claimed(w) => {
-                let repo = amm.run(&w.run_id).map(|r| (r.repo, r.integration_branch)).map_err(|e| e.0);
+                let repo = amm.run(&w.run_id).map(|r| (r.repo, r.integration_head)).map_err(|e| e.0);
                 (w, repo)
             }
         }
     };
     let check = match repo {
-        Ok((repo, branch)) => {
+        Ok((repo, head)) => {
             let (cwd, validate) = (cwd.to_string(), seams.validate.clone());
-            tokio::task::spawn_blocking(move || validate(Path::new(&repo), Path::new(&cwd), &branch))
+            tokio::task::spawn_blocking(move || validate(Path::new(&repo), Path::new(&cwd), head.as_deref()))
                 .await
                 .unwrap_or_else(|e| Err(format!("worktree validation failed: {e}")))
         }
@@ -509,16 +509,18 @@ struct Gate {
 }
 
 /// The commit `sha`'s changes are measured from: the worker's bind-time `base`, or, once the worker has merged
-/// integration work, `merge-base(sha, integration_head)` when that descends from `base`. That is the merge base the
-/// merge queue will use, so exactly the changes it would merge are scope-checked. Errors if git cannot tell.
+/// integration work, the merge base of `sha` and `integration_head` (recorded by amm, never the live ref) when there
+/// is exactly one and it descends from `base`. With several (a criss-cross), git's virtual base is not a commit the
+/// gate could diff, so the bind base is used. Errors if git cannot tell.
 fn effective_base(wt: &Path, base: &str, sha: &str, integration_head: Option<&str>) -> Result<String, String> {
     let Some(head) = integration_head.filter(|h| !h.is_empty()) else { return Ok(base.to_string()) };
-    let mb = git(wt, &["merge-base", "--end-of-options", sha, head])?;
-    let mb_sha = mb.stdout.trim();
-    if mb.code != 0 || mb_sha.is_empty() || mb_sha == base {
+    let mb = git(wt, &["merge-base", "--all", "--end-of-options", sha, head])?;
+    let bases: Vec<&str> = mb.stdout.split_whitespace().collect();
+    let [one] = bases[..] else { return Ok(base.to_string()) };
+    if mb.code != 0 || one == base {
         return Ok(base.to_string());
     }
-    Ok(if is_ancestor(wt, base, mb_sha)? { mb_sha.to_string() } else { base.to_string() })
+    Ok(if is_ancestor(wt, base, one)? { one.to_string() } else { base.to_string() })
 }
 
 /// The done gate's git and check work. Blocking: run it on the blocking pool, without the lock.
@@ -715,6 +717,7 @@ mod tests {
                 repo: main.to_string_lossy().into(),
                 test_cmd: "true".into(),
                 base_branch: "main".into(),
+                integration_head: Some(git_in(&main, &["rev-parse", "HEAD"])),
                 ..Default::default()
             })
             .unwrap();
@@ -1181,6 +1184,67 @@ mod tests {
         assert!(reason(&out).contains("outside your scope: README.md"), "{out}");
     }
 
+    #[tokio::test]
+    async fn a_worker_branched_from_a_forged_base_branch_fails_the_gate() {
+        let (state, main, _repo, run, _b, dir) = dispatched_in(&[]);
+        // Worker 1 points main at a commit holding an out-of-scope change.
+        let side = add_worktree(&main, &rand_name());
+        std::fs::write(side.join("README.md"), "evil\n").unwrap();
+        commit_all(&side, "evil");
+        let x = git_in(&side, &["rev-parse", "HEAD"]);
+        git_in(&main, &["update-ref", "refs/heads/main", &x]);
+        // A later worker's worktree is branched from the forged main.
+        let b2 = state.lock().unwrap().add_brief(&run.id, brief_input(&["src/**"], &[]), BriefState::Queued).unwrap();
+        {
+            let mut amm = state.lock().unwrap();
+            let w1 = amm.worker_for_brief(&_b.id).unwrap();
+            amm.cancel(&w1.brief_id).unwrap();
+            amm.dispatch(&run.id).unwrap();
+        }
+        let repo2 = add_worktree(&main, &rand_name());
+        assert_eq!(git_in(&repo2, &["rev-parse", "HEAD"]), x);
+        let h = Bound { state, repo: repo2, b: b2, dir };
+        let got = h
+            .hook("PreToolUse", json!({ "tool_name": "mcp__plugin_amm_amm__amm_brief_get", "tool_input": { "token": h.b.id } }))
+            .await;
+        assert_eq!(deny_reason(&got), None, "{got}");
+        h.report(ReportStatus::Done);
+        let out = h.hook("SubagentStop", json!({})).await;
+        assert!(reason(&out).contains("outside your scope: README.md"), "{out}");
+    }
+
+    #[test]
+    fn effective_base_ignores_a_criss_cross_merge_base() {
+        let dir = init_repo_with(&[("src/a.ts", "a\n")]);
+        let id = ["-c", "user.email=t@t", "-c", "user.name=t"];
+        let g = |args: &[&str]| git_in(&dir, &[&id[..], args].concat());
+        let base = g(&["rev-parse", "HEAD"]);
+        let commit_file = |branch: &str, file: &str| {
+            g(&["checkout", "-q", "-b", branch, &base]);
+            std::fs::create_dir_all(dir.join("lib")).unwrap();
+            std::fs::write(dir.join(file), "x\n").unwrap();
+            g(&["add", "."]);
+            g(&["commit", "-qm", branch]);
+            g(&["rev-parse", "HEAD"])
+        };
+        let g1 = commit_file("g1", "lib/a.ts");
+        let g2 = commit_file("g2", "lib/b.ts");
+        g(&["checkout", "-q", "-b", "integ", &base]);
+        g(&["merge", "-q", "--no-ff", "--no-edit", &g1]);
+        g(&["merge", "-q", "--no-ff", "--no-edit", &g2]);
+        let head = g(&["rev-parse", "HEAD"]);
+        g(&["checkout", "-q", "-b", "worker", &base]);
+        g(&["merge", "-q", "--no-ff", "--no-edit", &g2]);
+        g(&["merge", "-q", "--no-edit", "-s", "ours", &g1]);
+        let w = g(&["rev-parse", "HEAD"]);
+        assert_eq!(effective_base(&dir, &base, &w, Some(&head)).unwrap(), base);
+        // A single merge base that descends from the bind base is used.
+        g(&["checkout", "-q", "-b", "fair", &base]);
+        g(&["merge", "-q", "--no-edit", &head]);
+        let fair = g(&["rev-parse", "HEAD"]);
+        assert_eq!(effective_base(&dir, &base, &fair, Some(&head)).unwrap(), head);
+    }
+
     fn stop_input() -> HookInput {
         serde_json::from_value(json!({ "session_id": "s", "cwd": "/", "hook_event_name": "SubagentStop", "agent_id": "ag1",
                                        "agent_type": "amm:amm-worker-light" }))
@@ -1286,9 +1350,9 @@ mod tests {
         let seams = {
             let (st, id) = (state.clone(), b.id.clone());
             Seams {
-                validate: Arc::new(move |run_repo, cwd, branch| {
+                validate: Arc::new(move |run_repo, cwd, head| {
                     st.lock().unwrap().cancel(&id).unwrap();
-                    validate_worktree(run_repo, cwd, branch)
+                    validate_worktree(run_repo, cwd, head)
                 }),
                 ..Seams::default()
             }
